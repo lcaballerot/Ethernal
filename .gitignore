@@ -1,0 +1,10 @@
+node_modules/
+.claude/
+.env
+res/BOT_TOKEN.md
+res/BOT_TOKEN.txt
+cookies.txt
+yt-dlp.exe
+[REDACTADO].pem
+*.log
+npm-debug.log*

@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  ethernal-mongo:
+    image: mongo:7
+    container_name: ethernal-mongo
+    restart: unless-stopped
+    volumes:
+      - ethernal_mongo_data:/data/db
+    networks:
+      - ethernal-net
+
+  ethernal-bot:
+    build: .
+    container_name: ethernal-bot
+    restart: unless-stopped
+    depends_on:
+      - ethernal-mongo
+    volumes:
+      - ./res:/app/res
+      - ./index.js:/app/index.js
+      - ./cookies.txt:/app/cookies.txt
+    networks:
+      - ethernal-net
+    environment:
+      - NODE_ENV=production
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - MONGO_URL=mongodb://ethernal-mongo:27017/ethernal
+
+volumes:
+  ethernal_mongo_data:
+
+networks:
+  ethernal-net:
+    driver: bridge

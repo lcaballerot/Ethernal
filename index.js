@@ -165,6 +165,7 @@ const slashCommands = [
     new SlashCommandBuilder().setName('unmute').setDescription('Quitar el silencio (timeout) a un miembro')
         .addUserOption(o => o.setName('target').setDescription('Miembro a reactivar').setRequired(true))
         .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false)),
+    new SlashCommandBuilder().setName('toggle-greets').setDescription('Activa o desactiva los mensajes de bienvenida públicos en este canal'),
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
@@ -1886,7 +1887,7 @@ const AUTO_ROLES = {
 
 const MODC = { GREEN: 0x9B59B6, RED: 0x8B0000, ORANGE: 0xFF8008, PURPLE: 0x8A2387, BLUE: 0x4E65FF };
 const WARNING_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // los avisos expiran a los 7 días
-const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute']);
+const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute', 'toggle-greets']);
 
 // ─── Persistencia de avisos / watchlist en MongoDB ───
 const warningSchema = new mongoose.Schema({
@@ -1898,6 +1899,14 @@ const watchlistSchema = new mongoose.Schema({
     guildId: String, userId: String, addedAt: Number, addedBy: String, reason: String,
 });
 const WatchlistEntry = mongoose.model('WatchlistEntry', watchlistSchema);
+
+// Schema para almacenar la configuración de mensajes de bienvenida por servidor
+const welcomeConfigSchema = new mongoose.Schema({
+    guildId: { type: String, required: true, unique: true },
+    channelId: { type: String, required: true },
+    enabled: { type: Boolean, default: true }
+});
+const WelcomeConfig = mongoose.model('WelcomeConfig', welcomeConfigSchema);
 
 function getExpirationString(warn) {
     const remainingMs = WARNING_DURATION_MS - (Date.now() - warn.timestamp);
@@ -2114,6 +2123,30 @@ client.on('guildMemberAdd', async (member) => {
         await sendAdminLog(member.guild, modEmbed('🛡️ Rol Concedido',
             `**Rol**: <@&${roleIdToAssign}>\n**Objetivo**: ${member.user}\n**Moderador**: <@${client.user.id}>\n**ID de Rol**: ${roleIdToAssign}`, MODC.GREEN));
     }
+
+    // Enviar saludo público de bienvenida si está configurado
+    if (!isBot) {
+        try {
+            const config = await WelcomeConfig.findOne({ guildId: member.guild.id });
+            if (config && config.enabled) {
+                const greetChannel = await member.guild.channels.fetch(config.channelId).catch(() => null);
+                if (greetChannel) {
+                    const welcomeEmbed = new EmbedBuilder()
+                        .setTitle(`👋 ¡Bienvenido/a a ${member.guild.name}!`)
+                        .setDescription(`¡Hola ${member}! Esperamos que te diviertas y disfrutes de tu estadía en nuestro servidor.\n\nNo olvides leer las reglas y pasarte por los canales de voz para escuchar música con el bot. 🎵`)
+                        .setColor(0xE42A36)
+                        .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+                        .setFooter({ text: `Eres el miembro #${member.guild.memberCount}`, iconURL: member.guild.iconURL({ dynamic: true }) || undefined })
+                        .setTimestamp();
+                    
+                    await greetChannel.send({ content: `¡Bienvenido/a ${member}! ✨`, embeds: [welcomeEmbed] }).catch(console.error);
+                }
+            }
+        } catch (e) {
+            console.error('[Welcome] Error al enviar mensaje de bienvenida:', e.message);
+        }
+    }
+
     if (!logChannel) return;
     const ageMs = Date.now() - member.user.createdAt.getTime();
     const embed = modEmbed(isBot ? '🤖 Bot Añadido' : '📥 Miembro Entró', `${member.user} se unió al servidor!`, MODC.GREEN, [
@@ -2459,6 +2492,30 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.reply({ embeds: [modEmbed('🔊 Silencio Removido', '', MODC.GREEN, [
                 { name: 'Usuario', value: `${targetMember.user} (\`${targetMember.id}\`)`, inline: true },
                 { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true }])] });
+        }
+        else if (commandName === 'toggle-greets') {
+            let config = await WelcomeConfig.findOne({ guildId: guild.id });
+            if (!config) {
+                config = await WelcomeConfig.create({
+                    guildId: guild.id,
+                    channelId: interaction.channelId,
+                    enabled: true
+                });
+            } else {
+                config.enabled = !config.enabled;
+                if (config.enabled) {
+                    config.channelId = interaction.channelId;
+                }
+                await config.save();
+            }
+
+            if (config.enabled) {
+                const embed = modEmbed('📥 Mensajes de Bienvenida', `Se han **activado** los mensajes de bienvenida públicos en este canal: <#${config.channelId}>.`, MODC.GREEN);
+                await interaction.reply({ embeds: [embed] });
+            } else {
+                const embed = modEmbed('📥 Mensajes de Bienvenida', 'Se han **desactivado** los mensajes de bienvenida públicos en este servidor.', MODC.RED);
+                await interaction.reply({ embeds: [embed] });
+            }
         }
     } catch (err) {
         console.error(`[Mod] /${commandName}:`, err.message);

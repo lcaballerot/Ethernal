@@ -1408,8 +1408,8 @@ async function playSong(guildId) {
         if (isSameSong && sq.nowPlayingMsg) {
             sq.nowPlayingMsg.edit({ embeds: [embed], components: [row] }).catch(() => { });
         } else {
-            // Quitar botones del mensaje antiguo de "Sonando ahora"
-            if (sq.nowPlayingMsg) { sq.nowPlayingMsg.edit({ components: [] }).catch(() => { }); }
+            // Borrar el mensaje antiguo de "Sonando ahora" para no inundar el chat
+            if (sq.nowPlayingMsg) { sq.nowPlayingMsg.delete().catch(() => { }); sq.nowPlayingMsg = null; }
             sq.nowPlayingMsg = await sq.textChannel?.send({ embeds: [embed], components: [row] }).catch(() => null);
         }
 

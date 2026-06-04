@@ -1,7 +1,7 @@
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
-const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder, ActivityType, ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, ActivityType, ButtonBuilder, ButtonStyle, ActionRowBuilder, PermissionFlagsBits, AuditLogEvent, ChannelType } = require('discord.js');
 const {
     joinVoiceChannel,
     createAudioPlayer,
@@ -84,7 +84,12 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildInvites,
     ],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.GuildMember, Partials.User],
 });
 
 const queue = new Map();
@@ -137,6 +142,29 @@ const slashCommands = [
         .addStringOption(o => o.setName('time').setDescription('Tiempo ej. 4:36, 1:23:45, 2m30s').setRequired(true)),
     new SlashCommandBuilder().setName('tts').setDescription('Texto a voz en el canal de voz (Premium)')
         .addStringOption(o => o.setName('text').setDescription('Texto a decir').setRequired(true)),
+    // ─── Moderación (Creador / Co-Owner) ───
+    new SlashCommandBuilder().setName('warn').setDescription('Avisar a un miembro del servidor')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a avisar').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Razón del aviso').setRequired(true)),
+    new SlashCommandBuilder().setName('warnings').setDescription('Ver el historial de avisos de un miembro')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a consultar').setRequired(true)),
+    new SlashCommandBuilder().setName('clear-warnings').setDescription('Borrar todos los avisos de un miembro')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a limpiar').setRequired(true)),
+    new SlashCommandBuilder().setName('kick').setDescription('Expulsar a un miembro del servidor')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a expulsar').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false)),
+    new SlashCommandBuilder().setName('ban').setDescription('Banear a un miembro del servidor')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a banear').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false))
+        .addIntegerOption(o => o.setName('delete_messages').setDescription('Días de mensajes a borrar').setRequired(false)
+            .setChoices({ name: 'No borrar', value: 0 }, { name: 'Últimas 24h', value: 1 }, { name: 'Últimos 7 días', value: 7 })),
+    new SlashCommandBuilder().setName('mute').setDescription('Silenciar (timeout) a un miembro')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a silenciar').setRequired(true))
+        .addStringOption(o => o.setName('duration').setDescription('Duración (ej. 10m, 1h, 1d)').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false)),
+    new SlashCommandBuilder().setName('unmute').setDescription('Quitar el silencio (timeout) a un miembro')
+        .addUserOption(o => o.setName('target').setDescription('Miembro a reactivar').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false)),
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
@@ -599,6 +627,7 @@ client.on('messageCreate', async (message) => {
 // ─── Enrutador de comandos (slash) ────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
+    if (MOD_COMMANDS.has(interaction.commandName)) return; // gestionado por el módulo de moderación
 
     const serverQueue = queue.get(interaction.guild.id);
 
@@ -839,6 +868,14 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         // Limpiar timeout de salida
         if (sq.leaveTimeout) clearTimeout(sq.leaveTimeout);
 
+        // Eliminar la cola ANTES de detener el reproductor: player.stop() emite
+        // 'Idle' de forma SÍNCRONA, y si la cola todavía existe el manejador Idle
+        // reproduciría la siguiente canción (mensajes fantasma tras la desconexión).
+        queue.delete(guildId);
+
+        // Matar proceso ffmpeg si existe
+        if (sq.ffmpegProc) { try { sq.ffmpegProc.kill(); } catch { } sq.ffmpegProc = null; }
+
         // Detener reproductor
         try { sq.player.stop(true); } catch { }
 
@@ -853,8 +890,6 @@ client.on('voiceStateUpdate', (oldState, newState) => {
                     .setDescription('Desconectado del canal de voz — la cola se ha vaciado.')
             ]
         }).catch(() => { });
-
-        queue.delete(guildId);
     }
 });
 
@@ -1273,6 +1308,14 @@ async function playSong(guildId) {
             song.filePath = await downloadSong(song.url, guildId);
         }
 
+        // Si la cola se destruyó (p.ej. desconexión) mientras descargábamos,
+        // abortar en silencio: no reproducir ni enviar mensajes fantasma.
+        if (queue.get(guildId) !== sq) {
+            if (loadMsg) loadMsg.delete().catch(() => { });
+            if (song.filePath) safeDelete(song.filePath);
+            return;
+        }
+
         // Matar proceso ffmpeg anterior si existe
         if (sq.ffmpegProc) { try { sq.ffmpegProc.kill(); } catch { } sq.ffmpegProc = null; }
 
@@ -1379,6 +1422,8 @@ async function playSong(guildId) {
         sq._restarting = false;
         console.warn(`[Error de Play] ${song.title}: ${e.message}`);
         if (song.filePath) safeDelete(song.filePath);
+        // No avisar ni continuar si la cola ya no existe (desconexión durante la descarga)
+        if (queue.get(guildId) !== sq) return;
         sq.textChannel?.send({ embeds: [errEmbed(`Falló al reproducir **${fmt(song.title)}**`)] }).catch(() => { });
         sq.songs.shift();
         if (sq.songs.length > 0) playSong(guildId);
@@ -1789,5 +1834,605 @@ function errEmbed(msg) {
         .setColor(THEME.danger)
         .setDescription(msg);
 }
+
+// ════════════════════════════════════════════════════════════════════
+// MÓDULO DE MODERACIÓN Y REGISTRO (integrado del bot Administrator)
+// ════════════════════════════════════════════════════════════════════
+
+const ETHERNAL_GUILD_ID = '1511109290704896010';
+
+// Canales de logs dedicados (Ethernal)
+const LOG_CHANNELS = {
+    MOD_LOGS: '1511872792054726827',   // 𝗠𝗼𝗱『𝗟𝗼𝗴𝘀』
+    MSG_LOGS: '1511872930865352774',   // 𝗠𝗦𝗚『𝗟𝗼𝗴𝘀』
+    JOIN_LEFT: '1511404561745711204',  // 『👋』bienvenidos
+    VC_LOGS: '1511872995369418823',    // 𝗩𝗖-𝗜𝗻ﾉ𝗢𝘂𝘁『𝗟𝗼𝗴𝘀』
+    ADMIN_LOGS: '1511872683116200008', // 𝗔𝗱𝗺𝗶𝗻『𝗟𝗼𝗴𝘀』
+};
+
+// Roles de moderación (planos: ambos tienen autoridad total)
+const MOD_ROLES = {
+    CREADOR: '1511377184600752128',
+    CO_OWNER: '1511375931564888214',
+};
+
+// Auto-asignación de roles al entrar
+const AUTO_ROLES = {
+    USUARIOS: '1511404537120817334',       // humanos
+    ETHERNAL_BOTS: '1511404539624947823',  // bots
+};
+
+const MODC = { GREEN: 0x9B59B6, RED: 0x8B0000, ORANGE: 0xFF8008, PURPLE: 0x8A2387, BLUE: 0x4E65FF };
+const WARNING_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // los avisos expiran a los 7 días
+const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute']);
+
+// ─── Persistencia de avisos / watchlist en MongoDB ───
+const warningSchema = new mongoose.Schema({
+    guildId: String, userId: String, warnId: String,
+    moderatorId: String, reason: String, timestamp: Number,
+});
+const Warning = mongoose.model('Warning', warningSchema);
+const watchlistSchema = new mongoose.Schema({
+    guildId: String, userId: String, addedAt: Number, addedBy: String, reason: String,
+});
+const WatchlistEntry = mongoose.model('WatchlistEntry', watchlistSchema);
+
+function getExpirationString(warn) {
+    const remainingMs = WARNING_DURATION_MS - (Date.now() - warn.timestamp);
+    if (remainingMs <= 0) return 'Expirado';
+    const hours = Math.ceil(remainingMs / (1000 * 60 * 60));
+    if (hours <= 24) return `${hours} hora(s) restantes`;
+    return `${Math.ceil(hours / 24)} día(s) restantes`;
+}
+
+async function getWarnings(guildId, userId) {
+    const cutoff = Date.now() - WARNING_DURATION_MS;
+    await Warning.deleteMany({ guildId, userId, timestamp: { $lt: cutoff } });
+    const list = await Warning.find({ guildId, userId }).sort({ timestamp: 1 }).lean();
+    if (list.length < 3) await WatchlistEntry.deleteOne({ guildId, userId });
+    return list;
+}
+
+async function addWarning(guildId, userId, moderatorMember, reason) {
+    const warnId = Math.random().toString(36).substring(2, 9).toUpperCase();
+    await Warning.create({ guildId, userId, warnId, moderatorId: moderatorMember.id, reason, timestamp: Date.now() });
+    const active = await getWarnings(guildId, userId);
+    if (active.length >= 3) {
+        await WatchlistEntry.updateOne(
+            { guildId, userId },
+            { $setOnInsert: { addedAt: Date.now(), addedBy: moderatorMember.id, reason: 'Acumuló 3+ avisos en 7 días' } },
+            { upsert: true }
+        );
+    }
+    return { warnId, activeCount: active.length };
+}
+
+async function clearWarnings(guildId, userId) {
+    await Warning.deleteMany({ guildId, userId });
+    await WatchlistEntry.deleteOne({ guildId, userId });
+}
+
+// ─── Permisos: modelo plano de 2 roles ───
+function isModerator(member) {
+    if (!member) return false;
+    if (member.id === OWNER_ID) return true;
+    if (member.permissions?.has(PermissionFlagsBits.Administrator)) return true;
+    return member.roles.cache.has(MOD_ROLES.CREADOR) || member.roles.cache.has(MOD_ROLES.CO_OWNER);
+}
+
+function checkTarget(targetMember, executorMember) {
+    if (!targetMember) return { ok: true };
+    if (targetMember.id === client.user.id) return { ok: false, reason: 'No puedes moderar al propio bot.' };
+    if (targetMember.id === executorMember.id) return { ok: false, reason: 'No puedes moderarte a ti mismo.' };
+    if (targetMember.id === OWNER_ID && executorMember.id !== OWNER_ID) return { ok: false, reason: 'No puedes moderar al dueño del bot.' };
+    return { ok: true };
+}
+
+// ─── Utilidades de duración (sustituyen al paquete `ms`) ───
+function humanizeDuration(msVal) {
+    msVal = Math.abs(msVal);
+    const s = Math.floor(msVal / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+    if (d > 0) return `${d} día${d !== 1 ? 's' : ''}`;
+    if (h > 0) return `${h} hora${h !== 1 ? 's' : ''}`;
+    if (m > 0) return `${m} minuto${m !== 1 ? 's' : ''}`;
+    return `${s} segundo${s !== 1 ? 's' : ''}`;
+}
+function parseDuration(str) {
+    if (!str) return null;
+    const mt = String(str).trim().match(/^(\d+)\s*([smhdw])$/i);
+    if (!mt) return null;
+    const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[mt[2].toLowerCase()];
+    return parseInt(mt[1]) * mult;
+}
+
+function modEmbed(title, description, color = MODC.GREEN, fields = []) {
+    const e = new EmbedBuilder().setTitle(title).setColor(color).setTimestamp();
+    if (description) e.setDescription(description);
+    if (fields.length > 0) e.addFields(fields);
+    return e;
+}
+
+async function getLoggingChannel(guild, eventType) {
+    const map = { mod: LOG_CHANNELS.MOD_LOGS, msg: LOG_CHANNELS.MSG_LOGS, join_leave: LOG_CHANNELS.JOIN_LEFT, vc: LOG_CHANNELS.VC_LOGS, admin: LOG_CHANNELS.ADMIN_LOGS };
+    const id = map[eventType];
+    if (id) { try { const c = await guild.channels.fetch(id); if (c) return c; } catch { } }
+    return null;
+}
+
+async function sendAdminLog(guild, embed) {
+    try { const c = await getLoggingChannel(guild, 'admin'); if (c) await c.send({ embeds: [embed] }); }
+    catch (err) { console.error('[Mod] Falló admin-log:', err.message); }
+}
+
+async function getAuditLogEntry(guild, actionType, targetId = null, maxTimeDiffMs = 7000) {
+    try {
+        if (!guild.members.me?.permissions.has(PermissionFlagsBits.ViewAuditLog)) return null;
+        const logs = await guild.fetchAuditLogs({ limit: 5, type: actionType });
+        const now = Date.now();
+        for (const entry of logs.entries.values()) {
+            if (targetId && entry.target && entry.target.id !== targetId) continue;
+            if (now - entry.createdTimestamp < maxTimeDiffMs) return entry;
+        }
+    } catch (e) { console.error('[Mod] Falló audit log:', e.message); }
+    return null;
+}
+
+function getPermissionOverwritesDiff(oldChannel, newChannel) {
+    const diffs = [];
+    const oldO = oldChannel.permissionOverwrites.cache;
+    const newO = newChannel.permissionOverwrites.cache;
+    for (const [id, n] of newO.entries()) {
+        const o = oldO.get(id);
+        const t = n.type === 0 ? 'Rol' : 'Miembro';
+        const mention = n.type === 0 ? `<@&${id}>` : `<@${id}>`;
+        if (!o) {
+            const allowed = n.allow.toArray(), denied = n.deny.toArray();
+            let d = `➕ **Permisos añadidos para ${t}** ${mention}:\n`;
+            if (allowed.length) d += `  • **Permitido**: \`${allowed.join(', ')}\`\n`;
+            if (denied.length) d += `  • **Denegado**: \`${denied.join(', ')}\`\n`;
+            diffs.push(d);
+        } else {
+            const oa = o.allow.toArray(), od = o.deny.toArray(), na = n.allow.toArray(), nd = n.deny.toArray();
+            const aA = na.filter(p => !oa.includes(p)), aR = oa.filter(p => !na.includes(p));
+            const dA = nd.filter(p => !od.includes(p)), dR = od.filter(p => !nd.includes(p));
+            if (aA.length || aR.length || dA.length || dR.length) {
+                let d = `⚙️ **Permisos modificados para ${t}** ${mention}:\n`;
+                if (aA.length) d += `  • **Permitido +**: \`${aA.join(', ')}\`\n`;
+                if (aR.length) d += `  • **Permitido -**: \`${aR.join(', ')}\`\n`;
+                if (dA.length) d += `  • **Denegado +**: \`${dA.join(', ')}\`\n`;
+                if (dR.length) d += `  • **Denegado -**: \`${dR.join(', ')}\`\n`;
+                diffs.push(d);
+            }
+        }
+    }
+    for (const [id, o] of oldO.entries()) {
+        if (!newO.has(id)) {
+            const t = o.type === 0 ? 'Rol' : 'Miembro';
+            const mention = o.type === 0 ? `<@&${id}>` : `<@${id}>`;
+            diffs.push(`➖ **Eliminados todos los permisos para ${t}** ${mention}`);
+        }
+    }
+    return diffs;
+}
+
+// ─── Caché de mensajes (para deletes/edits rápidos) ───
+const modMessageCache = new Map();
+const MOD_MAX_CACHE = 5000;
+client.on('messageCreate', (message) => {
+    if (!message.guild || message.author?.bot) return;
+    modMessageCache.set(message.id, {
+        content: message.content, author: message.author, channel: message.channel,
+        attachments: message.attachments.map(a => ({ name: a.name, url: a.url })),
+    });
+    if (modMessageCache.size > MOD_MAX_CACHE) modMessageCache.delete(modMessageCache.keys().next().value);
+});
+
+// 1. Mensaje borrado
+client.on('messageDelete', async (message) => {
+    if (!message.guild || message.author?.bot) return;
+    const logChannel = await getLoggingChannel(message.guild, 'msg');
+    if (!logChannel) return;
+    let author = message.author, content = message.content, attachments = message.attachments;
+    const cached = modMessageCache.get(message.id);
+    if (cached) { author = cached.author; content = cached.content; attachments = cached.attachments; modMessageCache.delete(message.id); }
+    const authorDisplay = author ? `${author} (\`${author.id}\`)` : 'Autor desconocido (sin caché)';
+    const auditEntry = await getAuditLogEntry(message.guild, AuditLogEvent.MessageDelete, author?.id);
+    const deletedBy = auditEntry ? auditEntry.executor : null;
+    const embed = modEmbed('🗑️ Mensaje Borrado',
+        `**Autor**: ${authorDisplay}\n**Canal**: ${message.channel}\n` +
+        `**Borrado por**: ${deletedBy ? `${deletedBy} (\`${deletedBy.id}\`)` : 'Autor (propio/app)'}\n` +
+        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n**Contenido**:\n${content ? content.substring(0, 1500) : '*Sin caché o vacío*'}`,
+        MODC.RED);
+    if (author) embed.setThumbnail(author.displayAvatarURL({ dynamic: true }));
+    if (attachments && (attachments.size > 0 || attachments.length > 0)) {
+        const list = Array.isArray(attachments) ? attachments : Array.from(attachments.values());
+        embed.addFields({ name: 'Adjuntos', value: list.map(a => `[${a.name}](${a.url})`).join(', ').substring(0, 1024) });
+    }
+    logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 2. Mensaje editado
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+    const guild = newMessage.guild || oldMessage.guild;
+    if (!guild) return;
+    const author = newMessage.author || oldMessage.author;
+    if (!author || author.bot) return;
+    if (oldMessage.content === newMessage.content) return;
+    const logChannel = await getLoggingChannel(guild, 'msg');
+    if (!logChannel) return;
+    let oldContent = oldMessage.content;
+    const cached = modMessageCache.get(oldMessage.id);
+    if (cached && !oldContent) oldContent = cached.content;
+    modMessageCache.set(newMessage.id, {
+        content: newMessage.content, author, channel: newMessage.channel || oldMessage.channel,
+        attachments: newMessage.attachments.map(a => ({ name: a.name, url: a.url })),
+    });
+    const embed = modEmbed('✏️ Mensaje Editado',
+        `**Autor**: ${author} (\`${author.id}\`)\n**Canal**: ${newMessage.channel || oldMessage.channel}\n` +
+        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n**Enlace**: [Ir al mensaje](${newMessage.url})\n\n` +
+        `**Antes**:\n${oldContent ? oldContent.substring(0, 1000) : '*Sin caché*'}\n\n**Después**:\n${newMessage.content ? newMessage.content.substring(0, 1000) : '*Vacío*'}`,
+        MODC.ORANGE);
+    embed.setThumbnail(author.displayAvatarURL({ dynamic: true }));
+    logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 3. Miembro entra + auto-rol
+client.on('guildMemberAdd', async (member) => {
+    const logChannel = await getLoggingChannel(member.guild, 'join_leave');
+    const isBot = member.user.bot;
+    const roleIdToAssign = isBot ? AUTO_ROLES.ETHERNAL_BOTS : AUTO_ROLES.USUARIOS;
+    const roleName = isBot ? 'Ethernal Bots' : 'Usuarios';
+    let roleGranted = false, roleError = null;
+    try {
+        if (member.guild.members.me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+            await member.roles.add(roleIdToAssign); roleGranted = true;
+        } else roleError = 'El bot no tiene permiso de Gestionar Roles';
+    } catch (err) { roleError = err.message; }
+    if (roleGranted) {
+        await sendAdminLog(member.guild, modEmbed('🛡️ Rol Concedido',
+            `**Rol**: <@&${roleIdToAssign}>\n**Objetivo**: ${member.user}\n**Moderador**: <@${client.user.id}>\n**ID de Rol**: ${roleIdToAssign}`, MODC.GREEN));
+    }
+    if (!logChannel) return;
+    const ageMs = Date.now() - member.user.createdAt.getTime();
+    const embed = modEmbed(isBot ? '🤖 Bot Añadido' : '📥 Miembro Entró', `${member.user} se unió al servidor!`, MODC.GREEN, [
+        { name: 'Usuario', value: member.user.tag, inline: true },
+        { name: 'ID', value: `\`${member.id}\``, inline: true },
+        { name: 'Cuenta Creada', value: `${member.user.createdAt.toUTCString()} (hace ${humanizeDuration(ageMs)})` },
+        { name: 'Auto-Rol', value: roleGranted ? `✅ Rol **${roleName}** concedido.` : `❌ Falló **${roleName}**: ${roleError || 'Desconocido'}` },
+    ]);
+    if (!isBot && ageMs < 1000 * 60 * 60 * 24 * 3) embed.addFields({ name: '⚠️ Alerta', value: '¡Esta cuenta fue creada hace muy poco!' });
+    logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 4. Miembro sale / expulsado
+client.on('guildMemberRemove', async (member) => {
+    const logChannel = await getLoggingChannel(member.guild, 'join_leave');
+    if (!logChannel) return;
+    const kickEntry = await getAuditLogEntry(member.guild, AuditLogEvent.MemberKick, member.id);
+    const timeInServer = member.joinedTimestamp ? humanizeDuration(Date.now() - member.joinedTimestamp) : 'Desconocido';
+    const rolesList = member.roles.cache.filter(r => r.id !== member.guild.id).map(r => `<@&${r.id}>`).join(', ') || 'Sin roles';
+    const avatarUrl = member.user.displayAvatarURL({ dynamic: true });
+    if (kickEntry) {
+        const modChannel = await getLoggingChannel(member.guild, 'mod');
+        const embed = modEmbed('🚪 Miembro Expulsado',
+            `**Objetivo**: ${member.user} (\`${member.id}\`)\n**Expulsado por**: ${kickEntry.executor} (\`${kickEntry.executor.id}\`)\n` +
+            `**Tiempo en servidor**: \`${timeInServer}\`\n**Roles**: ${rolesList}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n**Razón**: ${kickEntry.reason || 'Sin razón'}`,
+            MODC.RED);
+        embed.setThumbnail(avatarUrl);
+        if (modChannel) modChannel.send({ embeds: [embed] }).catch(console.error);
+    } else {
+        const embed = modEmbed('📤 Miembro Salió',
+            `**Usuario**: ${member.user} (\`${member.id}\`)\n**Entró**: ${member.joinedAt ? `<t:${Math.floor(member.joinedAt.getTime() / 1000)}:f>` : 'Desconocido'}\n` +
+            `**Duración**: \`${timeInServer}\`\n**Roles**: ${rolesList}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`,
+            MODC.RED);
+        embed.setThumbnail(avatarUrl);
+        logChannel.send({ embeds: [embed] }).catch(console.error);
+    }
+});
+
+// 5. Ban
+client.on('guildBanAdd', async (ban) => {
+    const logChannel = await getLoggingChannel(ban.guild, 'mod');
+    if (!logChannel) return;
+    const entry = await getAuditLogEntry(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
+    const embed = modEmbed('🚫 Miembro Baneado',
+        `**Objetivo**: ${ban.user} (\`${ban.user.id}\`)\n**Baneado por**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n` +
+        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n**Razón**: ${entry?.reason || 'Sin razón'}`, MODC.RED);
+    embed.setThumbnail(ban.user.displayAvatarURL({ dynamic: true }));
+    logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 6. Unban
+client.on('guildBanRemove', async (ban) => {
+    const logChannel = await getLoggingChannel(ban.guild, 'mod');
+    if (!logChannel) return;
+    const entry = await getAuditLogEntry(ban.guild, AuditLogEvent.MemberBanRemove, ban.user.id);
+    const embed = modEmbed('🔓 Miembro Desbaneado',
+        `**Objetivo**: ${ban.user} (\`${ban.user.id}\`)\n**Desbaneado por**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`,
+        MODC.GREEN);
+    embed.setThumbnail(ban.user.displayAvatarURL({ dynamic: true }));
+    logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 7. Actualización de miembro (apodo, roles, timeout)
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+    if (oldMember.partial) { try { oldMember = await oldMember.fetch(); } catch { return; } }
+    if (newMember.partial) { try { newMember = await newMember.fetch(); } catch { return; } }
+    // Apodo
+    if (oldMember.nickname !== newMember.nickname) {
+        const modChannel = await getLoggingChannel(newMember.guild, 'mod');
+        if (modChannel) {
+            const entry = await getAuditLogEntry(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
+            const embed = modEmbed('👤 Apodo Actualizado',
+                `**Usuario**: ${newMember.user} (\`${newMember.user.id}\`)\n` + (entry?.executor ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '') +
+                `**Antes**: \`${oldMember.nickname || 'Ninguno'}\`\n**Después**: \`${newMember.nickname || 'Ninguno'}\`\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`,
+                MODC.ORANGE);
+            embed.setThumbnail(newMember.user.displayAvatarURL({ dynamic: true }));
+            modChannel.send({ embeds: [embed] }).catch(console.error);
+        }
+    }
+    // Roles
+    const oldRoles = oldMember.roles.cache, newRoles = newMember.roles.cache;
+    if (oldRoles.size !== newRoles.size) {
+        const added = newRoles.filter(r => !oldRoles.has(r.id)).filter(r => !r.managed);
+        const removed = oldRoles.filter(r => !newRoles.has(r.id)).filter(r => !r.managed);
+        const entry = await getAuditLogEntry(newMember.guild, AuditLogEvent.MemberRoleUpdate, newMember.id);
+        for (const [roleId] of added) {
+            await sendAdminLog(newMember.guild, modEmbed('🛡️ Rol Concedido',
+                `**Rol**: <@&${roleId}>\n**Objetivo**: ${newMember.user}\n` + (entry?.executor ? `**Moderador**: ${entry.executor}\n` : '') + `**ID de Rol**: ${roleId}`, MODC.GREEN));
+        }
+        for (const [roleId, role] of removed) {
+            await sendAdminLog(newMember.guild, modEmbed('🛡️ Rol Removido',
+                `**Rol**: ${role.name}\n**Objetivo**: ${newMember.user}\n` + (entry?.executor ? `**Moderador**: ${entry.executor}\n` : '') + `**ID de Rol**: ${roleId}`, MODC.RED));
+        }
+    }
+    // Timeout
+    const oldT = oldMember.communicationDisabledUntil, newT = newMember.communicationDisabledUntil;
+    if (oldT !== newT) {
+        const modChannel = await getLoggingChannel(newMember.guild, 'mod');
+        if (modChannel) {
+            const avatarUrl = newMember.user.displayAvatarURL({ dynamic: true });
+            if (newT && (!oldT || oldT.getTime() !== newT.getTime())) {
+                const entry = await getAuditLogEntry(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
+                const embed = modEmbed('🔇 Miembro Silenciado',
+                    `**Usuario**: ${newMember.user} (\`${newMember.user.id}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n` +
+                    `**Duración**: \`${humanizeDuration(newT.getTime() - Date.now())}\`\n**Hasta**: <t:${Math.floor(newT.getTime() / 1000)}:f>\n\n**Razón**: ${entry?.reason || 'Sin razón'}`,
+                    MODC.ORANGE);
+                embed.setThumbnail(avatarUrl);
+                modChannel.send({ embeds: [embed] }).catch(console.error);
+            } else if (!newT && oldT) {
+                const entry = await getAuditLogEntry(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
+                const embed = modEmbed('🔊 Silencio Removido',
+                    `**Usuario**: ${newMember.user} (\`${newMember.user.id}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`,
+                    MODC.GREEN);
+                embed.setThumbnail(avatarUrl);
+                modChannel.send({ embeds: [embed] }).catch(console.error);
+            }
+        }
+    }
+});
+
+// 8. Estados de voz (registro)
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    const member = newState.member || oldState.member;
+    if (!member || member.id === client.user.id) return; // no registrar al propio bot
+    const guild = newState.guild || oldState.guild;
+    const logChannel = await getLoggingChannel(guild, 'vc');
+    if (!logChannel) return;
+    const user = member.user;
+    const avatarUrl = user.displayAvatarURL({ dynamic: true });
+    let embed = null;
+    if (!oldState.channelId && newState.channelId) {
+        embed = modEmbed('📥 Entró a Canal de Voz',
+            `**Usuario**: ${user} (\`${user.id}\`)\n**Canal**: ${newState.channel}\n**Miembros**: \`${newState.channel?.members.size || 0}\`\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, 0x2ECC71);
+    } else if (oldState.channelId && !newState.channelId) {
+        const disc = await getAuditLogEntry(guild, AuditLogEvent.MemberDisconnect, member.id, 5000);
+        if (disc) {
+            const modChannel = await getLoggingChannel(guild, 'mod');
+            if (modChannel) {
+                const d = modEmbed('❌ Desconectado de Voz',
+                    `**Usuario**: ${user} (\`${user.id}\`)\n**Moderador**: ${disc.executor} (\`${disc.executor.id}\`)\n**Canal**: ${oldState.channel}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.RED);
+                d.setThumbnail(avatarUrl);
+                modChannel.send({ embeds: [d] }).catch(console.error);
+            }
+        }
+        embed = modEmbed('📤 Salió de Canal de Voz',
+            `**Usuario**: ${user} (\`${user.id}\`)\n**Canal**: ${oldState.channel}\n**Miembros**: \`${oldState.channel?.members.size || 0}\`\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.RED);
+    } else if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+        const entry = await getAuditLogEntry(guild, AuditLogEvent.MemberMove, null, 5000);
+        let desc = `**Usuario**: ${user} (\`${user.id}\`)\n**De**: ${oldState.channel}\n**A**: ${newState.channel}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`;
+        if (entry && entry.executor.id !== member.id) desc += `\n**Movido por**: ${entry.executor} (\`${entry.executor.id}\`)`;
+        embed = modEmbed('🔀 Cambió de Canal de Voz', desc, MODC.ORANGE);
+    }
+    if (oldState.channelId && newState.channelId && oldState.serverMute !== newState.serverMute) {
+        const modChannel = await getLoggingChannel(guild, 'mod');
+        if (modChannel) {
+            const entry = await getAuditLogEntry(guild, AuditLogEvent.MemberUpdate, member.id);
+            modChannel.send({ embeds: [modEmbed(newState.serverMute ? '🎤❌ Silenciado en Servidor' : '🎤 Des-silenciado',
+                `**Usuario**: ${user} (\`${user.id}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.ORANGE)] }).catch(console.error);
+        }
+    }
+    if (oldState.channelId && newState.channelId && oldState.serverDeaf !== newState.serverDeaf) {
+        const modChannel = await getLoggingChannel(guild, 'mod');
+        if (modChannel) {
+            const entry = await getAuditLogEntry(guild, AuditLogEvent.MemberUpdate, member.id);
+            modChannel.send({ embeds: [modEmbed(newState.serverDeaf ? '🔇 Ensordecido en Servidor' : '🔊 Des-ensordecido',
+                `**Usuario**: ${user} (\`${user.id}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.ORANGE)] }).catch(console.error);
+        }
+    }
+    if (embed) { embed.setThumbnail(avatarUrl); logChannel.send({ embeds: [embed] }).catch(console.error); }
+});
+
+// 9. Canales
+client.on('channelCreate', async (channel) => {
+    if (!channel.guild) return;
+    const logChannel = await getLoggingChannel(channel.guild, 'admin');
+    if (!logChannel) return;
+    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
+    logChannel.send({ embeds: [modEmbed('🆕 Canal Creado',
+        `**Canal**: ${channel} (\`#${channel.name}\`)\n**Tipo**: \`${ChannelType[channel.type] || 'Desconocido'}\`\n**Categoría**: ${channel.parent ? channel.parent.name : 'Ninguna'}\n` +
+        `**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.GREEN)] }).catch(console.error);
+});
+client.on('channelDelete', async (channel) => {
+    if (!channel.guild) return;
+    const logChannel = await getLoggingChannel(channel.guild, 'admin');
+    if (!logChannel) return;
+    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
+    logChannel.send({ embeds: [modEmbed('🗑️ Canal Eliminado',
+        `**Nombre**: \`${channel.name}\`\n**Tipo**: \`${ChannelType[channel.type] || 'Desconocido'}\`\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.RED)] }).catch(console.error);
+});
+client.on('channelUpdate', async (oldChannel, newChannel) => {
+    if (!oldChannel.guild) return;
+    const logChannel = await getLoggingChannel(newChannel.guild, 'admin');
+    if (!logChannel) return;
+    let changed = false;
+    const entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+    let desc = `**Canal**: ${newChannel} (\`#${newChannel.name}\`)\n**Moderador**: ${entry ? entry.executor : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n`;
+    if (oldChannel.name !== newChannel.name) { desc += `📝 **Nombre**:\n• Antes: \`${oldChannel.name}\`\n• Después: \`${newChannel.name}\`\n\n`; changed = true; }
+    if (oldChannel.topic !== newChannel.topic) { desc += `📝 **Tema**:\n• Antes: \`${oldChannel.topic || 'Ninguno'}\`\n• Después: \`${newChannel.topic || 'Ninguno'}\`\n\n`; changed = true; }
+    const overwrites = getPermissionOverwritesDiff(oldChannel, newChannel);
+    if (overwrites.length) { desc += `🔒 **Permisos actualizados**:\n${overwrites.join('\n')}\n\n`; changed = true; }
+    if (!changed) return;
+    if (desc.length <= 4000) logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc, MODC.ORANGE)] }).catch(console.error);
+    else logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc.substring(0, 3800) + '\n*(continúa...)*', MODC.ORANGE), modEmbed('⚙️ Canal Actualizado (2)', '*(...)*\n\n' + desc.substring(3800), MODC.ORANGE)] }).catch(console.error);
+});
+
+// 10. Roles
+client.on('roleCreate', async (role) => {
+    const entry = role.managed ? null : await getAuditLogEntry(role.guild, AuditLogEvent.RoleCreate, role.id);
+    await sendAdminLog(role.guild, modEmbed('🎨 Rol Creado',
+        `**Rol**: <@&${role.id}>\n` + (entry?.executor ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '') + `**ID de Rol**: ${role.id}` + (role.managed ? '\n*(Rol de integración)*' : ''), MODC.GREEN));
+});
+client.on('roleDelete', async (role) => {
+    const entry = role.managed ? null : await getAuditLogEntry(role.guild, AuditLogEvent.RoleDelete, role.id);
+    await sendAdminLog(role.guild, modEmbed('🗑️ Rol Eliminado',
+        `**Rol**: ${role.name}\n` + (entry?.executor ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '') + `**ID de Rol**: ${role.id}` + (role.managed ? '\n*(Rol de integración)*' : ''), MODC.RED));
+});
+client.on('roleUpdate', async (oldRole, newRole) => {
+    const entry = await getAuditLogEntry(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+    const executor = entry ? entry.executor : 'Desconocido';
+    if (oldRole.name !== newRole.name)
+        await sendAdminLog(newRole.guild, modEmbed('⚙️ Rol Actualizado', `Nombre cambiado por **${executor}**.\n\n**Antes**\n${oldRole.name}\n\n**Después**\n${newRole.name}\n\n**ID de Rol**: ${newRole.id}`, MODC.ORANGE));
+    if (oldRole.hexColor !== newRole.hexColor)
+        await sendAdminLog(newRole.guild, modEmbed('⚙️ Rol Actualizado', `Color cambiado por **${executor}**.\n\n**Antes**\n${oldRole.hexColor}\n\n**Después**\n${newRole.hexColor}\n\n**ID de Rol**: ${newRole.id}`, MODC.ORANGE));
+    if (oldRole.permissions.bitfield !== newRole.permissions.bitfield) {
+        const added = newRole.permissions.toArray().filter(p => !oldRole.permissions.has(p));
+        const removed = oldRole.permissions.toArray().filter(p => !newRole.permissions.has(p));
+        if (added.length || removed.length) {
+            let d = `Permisos cambiados por **${executor}**.\n\n`;
+            if (added.length) d += `**Añadidos**:\n+ ${added.join('\n+ ')}\n\n`;
+            if (removed.length) d += `**Removidos**:\n- ${removed.join('\n- ')}\n\n`;
+            d += `**ID de Rol**: ${newRole.id}`;
+            await sendAdminLog(newRole.guild, modEmbed('⚙️ Rol Actualizado', d, MODC.ORANGE));
+        }
+    }
+});
+
+// ─── Comandos de moderación ───
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (!MOD_COMMANDS.has(interaction.commandName)) return;
+    const { commandName, options, guild, member, user } = interaction;
+    if (!guild) return interaction.reply({ content: '❌ Los comandos de moderación solo funcionan en servidores.', ephemeral: true });
+    if (!isModerator(member)) {
+        return interaction.reply({ embeds: [modEmbed('❌ Permiso Denegado', 'Necesitas el rol **Creador** o **Co-Owner** para usar comandos de moderación.', MODC.RED)], ephemeral: true });
+    }
+    try {
+        if (commandName === 'warn') {
+            const targetMember = options.getMember('target');
+            const reason = options.getString('reason');
+            if (!targetMember) return interaction.reply({ content: '❌ No se encontró a ese miembro.', ephemeral: true });
+            const t = checkTarget(targetMember, member);
+            if (!t.ok) return interaction.reply({ content: `❌ ${t.reason}`, ephemeral: true });
+            const warnInfo = await addWarning(guild.id, targetMember.id, member, reason);
+            const embed = modEmbed('⚠️ Miembro Avisado', '', MODC.ORANGE, [
+                { name: 'Usuario', value: `${targetMember.user} (\`${targetMember.id}\`)`, inline: true },
+                { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true },
+                { name: 'ID Aviso', value: `\`${warnInfo.warnId}\``, inline: true },
+                { name: 'Avisos Activos', value: `\`${warnInfo.activeCount}\``, inline: true },
+                { name: 'Razón', value: reason },
+            ]);
+            await interaction.reply({ embeds: [embed] });
+            const logChannel = await getLoggingChannel(guild, 'mod');
+            if (logChannel) logChannel.send({ embeds: [embed] }).catch(console.error);
+            await targetMember.send(`⚠️ Has sido avisado en **${guild.name}** por: *${reason}*`).catch(() => { });
+        }
+        else if (commandName === 'warnings') {
+            const targetUser = options.getUser('target');
+            const history = await getWarnings(guild.id, targetUser.id);
+            const embed = modEmbed(`📋 Avisos de ${targetUser.tag}`,
+                history.length === 0 ? 'Historial limpio. 0 avisos activos.' : `Este usuario tiene **${history.length}** aviso(s).`, MODC.BLUE);
+            history.forEach((warn, i) => embed.addFields({
+                name: `Aviso #${i + 1} [ID: ${warn.warnId}]`,
+                value: `• **Moderador**: <@${warn.moderatorId}>\n• **Fecha**: ${new Date(warn.timestamp).toUTCString()}\n• **Estado**: ${getExpirationString(warn)}\n• **Razón**: *${warn.reason}*`,
+            }));
+            await interaction.reply({ embeds: [embed] });
+        }
+        else if (commandName === 'clear-warnings') {
+            const targetUser = options.getUser('target');
+            await clearWarnings(guild.id, targetUser.id);
+            const embed = modEmbed('🧼 Avisos Borrados', `Se borraron todos los avisos activos de ${targetUser}.`, MODC.GREEN, [{ name: 'Staff', value: `${user} (\`${user.id}\`)` }]);
+            await interaction.reply({ embeds: [embed] });
+            const logChannel = await getLoggingChannel(guild, 'mod');
+            if (logChannel) logChannel.send({ embeds: [embed] }).catch(console.error);
+        }
+        else if (commandName === 'kick') {
+            const targetMember = options.getMember('target');
+            const reason = options.getString('reason') || 'Sin razón';
+            if (!targetMember) return interaction.reply({ content: '❌ No se encontró a ese miembro.', ephemeral: true });
+            const t = checkTarget(targetMember, member);
+            if (!t.ok) return interaction.reply({ content: `❌ ${t.reason}`, ephemeral: true });
+            if (!targetMember.kickable) return interaction.reply({ content: '❌ No puedo expulsar a este usuario (jerarquía de roles).', ephemeral: true });
+            await targetMember.kick(`${reason} | Mod: ${user.tag}`);
+            await interaction.reply({ embeds: [modEmbed('🥾 Miembro Expulsado', '', MODC.RED, [
+                { name: 'Usuario', value: `${targetMember.user} (\`${targetMember.id}\`)`, inline: true },
+                { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true }, { name: 'Razón', value: reason }])] });
+        }
+        else if (commandName === 'ban') {
+            const targetUser = options.getUser('target');
+            const reason = options.getString('reason') || 'Sin razón';
+            const deleteDays = options.getInteger('delete_messages') || 0;
+            const targetMember = guild.members.cache.get(targetUser.id);
+            const t = checkTarget(targetMember, member);
+            if (!t.ok) return interaction.reply({ content: `❌ ${t.reason}`, ephemeral: true });
+            if (targetMember && !targetMember.bannable) return interaction.reply({ content: '❌ No puedo banear a este usuario.', ephemeral: true });
+            await guild.members.ban(targetUser.id, { deleteMessageSeconds: deleteDays * 86400, reason: `${reason} | Mod: ${user.tag}` });
+            await interaction.reply({ embeds: [modEmbed('🚫 Miembro Baneado', '', MODC.RED, [
+                { name: 'Usuario', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true },
+                { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true }, { name: 'Razón', value: reason }])] });
+        }
+        else if (commandName === 'mute') {
+            const targetMember = options.getMember('target');
+            const durationStr = options.getString('duration');
+            const reason = options.getString('reason') || 'Sin razón';
+            if (!targetMember) return interaction.reply({ content: '❌ No se encontró a ese miembro.', ephemeral: true });
+            const t = checkTarget(targetMember, member);
+            if (!t.ok) return interaction.reply({ content: `❌ ${t.reason}`, ephemeral: true });
+            const durationMs = parseDuration(durationStr);
+            if (!durationMs || durationMs < 5000 || durationMs > 28 * 86400000) return interaction.reply({ content: '❌ Duración inválida. Ej: 10m, 1h, 12h, 7d (máx 28d).', ephemeral: true });
+            if (!targetMember.moderatable) return interaction.reply({ content: '❌ No puedo silenciar a este miembro.', ephemeral: true });
+            await targetMember.timeout(durationMs, `${reason} | Mod: ${user.tag}`);
+            await interaction.reply({ embeds: [modEmbed('🔇 Miembro Silenciado', 'Restringido de enviar mensajes en todos los canales.', MODC.ORANGE, [
+                { name: 'Usuario', value: `${targetMember.user} (\`${targetMember.id}\`)`, inline: true },
+                { name: 'Duración', value: `\`${humanizeDuration(durationMs)}\``, inline: true },
+                { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true }, { name: 'Razón', value: reason }])] });
+        }
+        else if (commandName === 'unmute') {
+            const targetMember = options.getMember('target');
+            const reason = options.getString('reason') || 'Sin razón';
+            if (!targetMember) return interaction.reply({ content: '❌ No se encontró a ese miembro.', ephemeral: true });
+            if (!targetMember.communicationDisabledUntil) return interaction.reply({ content: '❌ Ese miembro no está silenciado.', ephemeral: true });
+            await targetMember.timeout(null, `${reason} | Mod: ${user.tag}`);
+            await interaction.reply({ embeds: [modEmbed('🔊 Silencio Removido', '', MODC.GREEN, [
+                { name: 'Usuario', value: `${targetMember.user} (\`${targetMember.id}\`)`, inline: true },
+                { name: 'Staff', value: `${user} (\`${user.id}\`)`, inline: true }])] });
+        }
+    } catch (err) {
+        console.error(`[Mod] /${commandName}:`, err.message);
+        const payload = { content: `❌ Operación fallida: ${err.message}`, ephemeral: true };
+        if (interaction.replied || interaction.deferred) interaction.followUp(payload).catch(() => { });
+        else interaction.reply(payload).catch(() => { });
+    }
+});
 
 client.login(TOKEN);

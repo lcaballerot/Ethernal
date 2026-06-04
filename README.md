@@ -30,6 +30,7 @@ Por seguridad, **estos archivos NO están en el repositorio** (están en `.gitig
 Disponible **solo** para los roles **Creador** y **Co-Owner** (ambos con autoridad total), el dueño del bot, o cualquier miembro con permiso de **Administrador**:
 - `/warn` · `/warnings` · `/clear-warnings` — Avisos (expiran a los 7 días, persistidos en MongoDB).
 - `/kick` · `/ban` · `/mute` (timeout, ej. `10m`, `1h`, `1d`) · `/unmute`.
+- `/toggle-greets` — Activa o desactiva los mensajes de bienvenida públicos en el canal actual.
 
 ### 📋 Registro (logs) automático
 Eventos enviados a canales dedicados:
@@ -39,9 +40,11 @@ Eventos enviados a canales dedicados:
 - **Mod**: bans/unbans, timeouts, cambios de apodo.
 - **Admin**: creación/edición/borrado de canales y roles, asignación/retiro de roles.
 
-### 🎭 Auto-roles al entrar
-- Humanos → **Usuarios**
-- Bots → **Ethernal Bots**
+### 📥 Entrada de nuevos miembros
+- **Mensaje de bienvenida**: Mensaje público personalizado con el avatar del usuario y su número de miembro (configurable en el canal deseado mediante el comando `/toggle-greets`).
+- **Auto-roles**:
+  - Humanos → **Usuarios**
+  - Bots → **Ethernal Bots**
 
 ---
 

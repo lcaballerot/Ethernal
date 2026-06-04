@@ -179,11 +179,24 @@ client.once('ready', async () => {
 
     client.user.setPresence({
         activities: [{
-            name: '🎵 Ethernal | /play',
-            type: ActivityType.Listening,
+            name: 'música para el clan Ethernal ⚔️ | /play',
+            type: ActivityType.Streaming,
+            url: 'https://www.twitch.tv/ethernal',
         }],
         status: 'online',
     });
+
+    // Biografía/descripción del bot (se muestra al pulsar su perfil)
+    try {
+        await new REST({ version: '10' }).setToken(TOKEN).patch('/applications/@me', {
+            body: {
+                description: '🎵 Bot oficial del clan **Ethernal** · Música de alta calidad desde YouTube y SoundCloud, con playlists, controles avanzados (volumen, velocidad, tono, TTS) y un sistema completo de moderación y registro.\n\n⚔️ Escribe `/play` y disfruta. ¡Únete a Ethernal y forma parte de la comunidad!',
+            },
+        });
+        console.log('[Boot] Descripción del bot actualizada.');
+    } catch (e) {
+        console.error('[Boot] No se pudo actualizar la descripción:', e.message);
+    }
 
     try {
         const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -2286,13 +2299,24 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     const logChannel = await getLoggingChannel(newChannel.guild, 'admin');
     if (!logChannel) return;
     let changed = false;
-    const entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
-    let desc = `**Canal**: ${newChannel} (\`#${newChannel.name}\`)\n**Moderador**: ${entry ? entry.executor : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n`;
-    if (oldChannel.name !== newChannel.name) { desc += `📝 **Nombre**:\n• Antes: \`${oldChannel.name}\`\n• Después: \`${newChannel.name}\`\n\n`; changed = true; }
-    if (oldChannel.topic !== newChannel.topic) { desc += `📝 **Tema**:\n• Antes: \`${oldChannel.topic || 'Ninguno'}\`\n• Después: \`${newChannel.topic || 'Ninguno'}\`\n\n`; changed = true; }
+    let body = '';
+    if (oldChannel.name !== newChannel.name) { body += `📝 **Nombre**:\n• Antes: \`${oldChannel.name}\`\n• Después: \`${newChannel.name}\`\n\n`; changed = true; }
+    // Movimiento entre categorías
+    if (oldChannel.parentId !== newChannel.parentId) {
+        const oldCat = oldChannel.parent ? `\`${oldChannel.parent.name}\`` : '*Ninguna*';
+        const newCat = newChannel.parent ? `\`${newChannel.parent.name}\`` : '*Ninguna*';
+        body += `📁 **Movido de categoría**:\n• Antes: ${oldCat}\n• Después: ${newCat}\n\n`; changed = true;
+    }
+    if (oldChannel.topic !== newChannel.topic) { body += `📝 **Tema**:\n• Antes: \`${oldChannel.topic || 'Ninguno'}\`\n• Después: \`${newChannel.topic || 'Ninguno'}\`\n\n`; changed = true; }
     const overwrites = getPermissionOverwritesDiff(oldChannel, newChannel);
-    if (overwrites.length) { desc += `🔒 **Permisos actualizados**:\n${overwrites.join('\n')}\n\n`; changed = true; }
+    if (overwrites.length) { body += `🔒 **Permisos actualizados**:\n${overwrites.join('\n')}\n\n`; changed = true; }
     if (!changed) return;
+    // Buscar al responsable en varios tipos de auditoría (mover/editar = ChannelUpdate; sync de permisos = ChannelOverwrite*)
+    let entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+    if (!entry) entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteUpdate, newChannel.id)
+        || await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteCreate, newChannel.id)
+        || await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteDelete, newChannel.id);
+    const desc = `**Canal**: ${newChannel} (\`#${newChannel.name}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n` + body;
     if (desc.length <= 4000) logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc, MODC.ORANGE)] }).catch(console.error);
     else logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc.substring(0, 3800) + '\n*(continúa...)*', MODC.ORANGE), modEmbed('⚙️ Canal Actualizado (2)', '*(...)*\n\n' + desc.substring(3800), MODC.ORANGE)] }).catch(console.error);
 });

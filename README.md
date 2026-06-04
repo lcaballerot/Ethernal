@@ -13,7 +13,7 @@ Por seguridad, **estos archivos NO están en el repositorio** (están en `.gitig
 | `.env` | `DISCORD_TOKEN`, `MONGO_URL` | Token desde el [Discord Developer Portal](https://discord.com/developers/applications) |
 | `res/BOT_TOKEN.md` | Token del bot (alternativa al `.env`) | Igual que arriba |
 | `cookies.txt` | Cookies de YouTube (necesarias para reproducir) | Generadas con `update_cookies.js` |
-| `[REDACTADO].pem` (`*.pem`) | Clave SSH para desplegar en el servidor | Privada, nunca compartir |
+| `*.pem` | Clave SSH para desplegar en el servidor | Privada, nunca compartir |
 
 > Sin token el bot no arranca; sin `cookies.txt` la reproducción de YouTube falla.
 

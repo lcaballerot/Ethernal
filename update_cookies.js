@@ -24,6 +24,7 @@ const readline = require('readline');
 const CONFIG = {
     sshHost: 'REDACTED',
     sshUser: 'ubuntu',
+    // Define la ruta de tu clave SSH con la variable de entorno ETHERNAL_SSH_KEY
     sshKeyPath: process.env.ETHERNAL_SSH_KEY || (os.platform() === 'win32'
         ? path.join('C:', 'Users', 'SysAdmin', 'Desktop', 'TheHubClub', '[REDACTADO].pem')
         : path.join(os.homedir(), '.ssh', '[REDACTADO].pem')),

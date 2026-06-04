@@ -179,7 +179,7 @@ client.once('ready', async () => {
 
     client.user.setPresence({
         activities: [{
-            name: 'música para el clan Ethernal ⚔️ | /play',
+            name: '✦ 𝗘𝘁𝗵𝗲𝗿𝗻𝗮𝗹 ✦  ·  /play',
             type: ActivityType.Streaming,
             url: 'https://www.twitch.tv/ethernal',
         }],
@@ -188,10 +188,19 @@ client.once('ready', async () => {
 
     // Biografía/descripción del bot (se muestra al pulsar su perfil)
     try {
+        const botBio = [
+            '✦ 　𝗘 𝗧 𝗛 𝗘 𝗥 𝗡 𝗔 𝗟　 ✦',
+            '𝘌𝘭 𝘣𝘰𝘵 𝘰𝘧𝘪𝘤𝘪𝘢𝘭 𝘥𝘦𝘭 𝘤𝘭𝘢𝘯 — 𝘮𝘶́𝘴𝘪𝘤𝘢 & 𝘤𝘰𝘮𝘶𝘯𝘪𝘥𝘢𝘥.',
+            '',
+            '꒰ 🎧 ꒱  𝗠𝘂́𝘀𝗶𝗰𝗮 𝗛𝗶-𝗙𝗶  ·  YouTube & SoundCloud',
+            '꒰ 🎚️ ꒱  𝗖𝗼𝗻𝘁𝗿𝗼𝗹 𝘁𝗼𝘁𝗮𝗹  ·  volumen · velocidad · tono · TTS',
+            '꒰ 📜 ꒱  𝗣𝗹𝗮𝘆𝗹𝗶𝘀𝘁𝘀 & cola inteligente',
+            '꒰ 🛡️ ꒱  𝗠𝗼𝗱𝗲𝗿𝗮𝗰𝗶𝗼́𝗻 & registros integrados',
+            '',
+            '▸  Escribe  `/play`  y déjate llevar.  ⚔️',
+        ].join('\n');
         await new REST({ version: '10' }).setToken(TOKEN).patch('/applications/@me', {
-            body: {
-                description: '🎵 Bot oficial del clan **Ethernal** · Música de alta calidad desde YouTube y SoundCloud, con playlists, controles avanzados (volumen, velocidad, tono, TTS) y un sistema completo de moderación y registro.\n\n⚔️ Escribe `/play` y disfruta. ¡Únete a Ethernal y forma parte de la comunidad!',
-            },
+            body: { description: botBio },
         });
         console.log('[Boot] Descripción del bot actualizada.');
     } catch (e) {

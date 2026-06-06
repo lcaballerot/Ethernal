@@ -2124,12 +2124,16 @@ client.on('guildMemberAdd', async (member) => {
             `**Rol**: <@&${roleIdToAssign}>\n**Objetivo**: ${member.user}\n**Moderador**: <@${client.user.id}>\n**ID de Rol**: ${roleIdToAssign}`, MODC.GREEN));
     }
 
+    // Estado del toggle de bienvenidas: gobierna tanto el saludo público
+    // como el embed de log "📥 Miembro Entró" (ambos caen en el canal 『👋』).
+    const welcomeConfig = !isBot ? await WelcomeConfig.findOne({ guildId: member.guild.id }) : null;
+    const greetsEnabled = !!(welcomeConfig && welcomeConfig.enabled);
+
     // Enviar saludo público de bienvenida si está configurado
     if (!isBot) {
         try {
-            const config = await WelcomeConfig.findOne({ guildId: member.guild.id });
-            if (config && config.enabled) {
-                const greetChannel = await member.guild.channels.fetch(config.channelId).catch(() => null);
+            if (greetsEnabled) {
+                const greetChannel = await member.guild.channels.fetch(welcomeConfig.channelId).catch(() => null);
                 if (greetChannel) {
                     const welcomeEmbed = new EmbedBuilder()
                         .setTitle(`👋 ¡Bienvenido/a a ${member.guild.name}!`)
@@ -2147,7 +2151,9 @@ client.on('guildMemberAdd', async (member) => {
         }
     }
 
-    if (!logChannel) return;
+    // Si las bienvenidas están desactivadas, no spamear el canal con el
+    // embed de "📥 Miembro Entró" (los logs de bots sí se mantienen).
+    if (!logChannel || (!isBot && !greetsEnabled)) return;
     const ageMs = Date.now() - member.user.createdAt.getTime();
     const embed = modEmbed(isBot ? '🤖 Bot Añadido' : '📥 Miembro Entró', `${member.user} se unió al servidor!`, MODC.GREEN, [
         { name: 'Usuario', value: member.user.tag, inline: true },
@@ -2176,6 +2182,11 @@ client.on('guildMemberRemove', async (member) => {
         embed.setThumbnail(avatarUrl);
         if (modChannel) modChannel.send({ embeds: [embed] }).catch(console.error);
     } else {
+        // Salida normal: respetar el toggle de bienvenidas (mismo canal 『👋』).
+        // Las expulsiones de arriba sí se registran siempre en el canal de mods.
+        const welcomeConfig = member.user.bot ? null : await WelcomeConfig.findOne({ guildId: member.guild.id });
+        const greetsEnabled = !!(welcomeConfig && welcomeConfig.enabled);
+        if (member.user.bot || !greetsEnabled) return;
         const embed = modEmbed('📤 Miembro Salió',
             `**Usuario**: ${member.user} (\`${member.id}\`)\n**Entró**: ${member.joinedAt ? `<t:${Math.floor(member.joinedAt.getTime() / 1000)}:f>` : 'Desconocido'}\n` +
             `**Duración**: \`${timeInServer}\`\n**Roles**: ${rolesList}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`,

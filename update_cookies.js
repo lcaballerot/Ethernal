@@ -21,15 +21,19 @@ const os = require('os');
 const readline = require('readline');
 
 // ─── Configuración ───────────────────────────────────────────────
+// Los datos del servidor se leen de variables de entorno para no exponerlos
+// en el repositorio:
+//   ETHERNAL_SSH_HOST     IP o host del servidor (obligatorio para subir)
+//   ETHERNAL_SSH_USER     usuario SSH (por defecto: ubuntu)
+//   ETHERNAL_SSH_KEY      ruta a la clave privada .pem (obligatorio para subir)
+//   ETHERNAL_REMOTE_PATH  ruta del stack en el servidor (opcional)
+//   ETHERNAL_CONTAINER    nombre del contenedor del bot (opcional)
 const CONFIG = {
-    sshHost: 'REDACTED',
-    sshUser: 'ubuntu',
-    // Define la ruta de tu clave SSH con la variable de entorno ETHERNAL_SSH_KEY
-    sshKeyPath: process.env.ETHERNAL_SSH_KEY || (os.platform() === 'win32'
-        ? path.join('C:', 'Users', 'SysAdmin', 'Desktop', 'TheHubClub', '[REDACTADO].pem')
-        : path.join(os.homedir(), '.ssh', '[REDACTADO].pem')),
-    remotePath: '/home/ubuntu/ethernal-stack/',
-    containerName: 'ethernal-bot',
+    sshHost: process.env.ETHERNAL_SSH_HOST,
+    sshUser: process.env.ETHERNAL_SSH_USER || 'ubuntu',
+    sshKeyPath: process.env.ETHERNAL_SSH_KEY,
+    remotePath: process.env.ETHERNAL_REMOTE_PATH || '/home/ubuntu/ethernal-stack/',
+    containerName: process.env.ETHERNAL_CONTAINER || 'ethernal-bot',
 };
 
 const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
@@ -142,6 +146,15 @@ function verifyCookies() {
 
 // ─── Paso 3: Subir al servidor por SSH ───────────────────────────
 async function uploadToServer() {
+    // Validar que los datos del servidor están definidos (vía variables de entorno)
+    if (!CONFIG.sshHost) {
+        logFail('Falta el host del servidor. Define la variable de entorno ETHERNAL_SSH_HOST.');
+        return false;
+    }
+    if (!CONFIG.sshKeyPath) {
+        logFail('Falta la clave SSH. Define la variable de entorno ETHERNAL_SSH_KEY con la ruta a tu .pem.');
+        return false;
+    }
     logInfo(`Subiendo a ${BOLD}${CONFIG.sshHost}${RESET}...`);
 
     // Comprobar que la clave SSH existe
@@ -202,6 +215,10 @@ async function uploadToServer() {
 
 // ─── Paso 4: Reiniciar el contenedor del bot ─────────────────────
 async function restartBot() {
+    if (!CONFIG.sshHost || !CONFIG.sshKeyPath) {
+        logFail('Faltan ETHERNAL_SSH_HOST o ETHERNAL_SSH_KEY; no se puede reiniciar el contenedor.');
+        return false;
+    }
     logInfo(`Reiniciando ${BOLD}${CONFIG.containerName}${RESET} en el servidor...`);
 
     try {

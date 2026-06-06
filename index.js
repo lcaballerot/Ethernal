@@ -28,6 +28,21 @@ const premiumSchema = new mongoose.Schema({
 });
 const PremiumUser = mongoose.model('PremiumUser', premiumSchema);
 
+// Instantánea de reproducción para reanudar tras un reinicio del bot
+const playbackSnapshotSchema = new mongoose.Schema({
+    guildId: { type: String, required: true, unique: true },
+    voiceChannelId: String,
+    textChannelId: String,
+    songs: { type: Array, default: [] },
+    position: { type: Number, default: 0 },
+    volume: { type: Number, default: 50 },
+    loop: { type: Boolean, default: false },
+    speed: { type: Number, default: 1.0 },
+    pitch: { type: Number, default: 1.0 },
+    savedAt: { type: Number, default: 0 },
+}, { minimize: false });
+const PlaybackSnapshot = mongoose.model('PlaybackSnapshot', playbackSnapshotSchema);
+
 
 
 // Multiplataforma: binarios incluidos en Windows, binarios del sistema en Linux
@@ -217,6 +232,14 @@ client.once('ready', async () => {
     }
 
     cleanupAllTemp();
+
+    // ─── Reanudar reproducción interrumpida por un reinicio ──────
+    // Restaura primero; luego activa el guardado periódico (respaldo ante caídas).
+    restorePlaybackSnapshots()
+        .catch(e => console.error('[Reanudar] Error al restaurar:', e.message))
+        .finally(() => {
+            setInterval(() => { savePlaybackSnapshots().catch(() => { }); }, 15000);
+        });
 
     // ─── Limpieza periódica de temporales (cada 30 min) ──────────
     setInterval(() => {
@@ -916,6 +939,323 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
 });
 
+// ─── Conexión de voz + manejadores del reproductor ───────────────
+// Extraído para compartirlo entre /play y la reanudación tras reinicio.
+// Devuelve la conexión (ya suscrita a qc.player) o null si falla (tras limpiar).
+async function connectVoice(guildId, vc, qc, adapterCreator) {
+    const sodium = require('libsodium-wrappers');
+    await sodium.ready;
+
+    function applyVpsFix(connection) {
+        // Solo manejar desconexiones DESPUÉS de que la conexión esté establecida
+        // para evitar destruirla durante el handshake UDP inicial
+        let fullyConnected = false;
+
+        connection.on('stateChange', (oldS, newS) => {
+            console.log(`[Conn] ${oldS.status} → ${newS.status}`);
+
+            // Limpiar keepAlive UDP (arreglo VPS para bucles de paquetes)
+            const newNetworking = Reflect.get(newS, 'networking');
+            if (newNetworking) {
+                newNetworking.on('stateChange', (oldNS, newNS) => {
+                    const newUdp = Reflect.get(newNS, 'udp');
+                    clearInterval(newUdp?.keepAliveInterval);
+                });
+            }
+
+            if (newS.status === VoiceConnectionStatus.Ready) {
+                fullyConnected = true;
+            }
+
+            if (newS.status === VoiceConnectionStatus.Disconnected && fullyConnected) {
+                try {
+                    entersState(connection, VoiceConnectionStatus.Connecting, 5000)
+                        .catch(() => {
+                            const q = queue.get(guildId);
+                            if (q) {
+                                for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
+                                if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
+                                q.textChannel.send({
+                                    embeds: [new EmbedBuilder().setColor(THEME.danger).setDescription('Desconectado del canal de voz — cola vaciada.')]
+                                }).catch(() => { });
+                            }
+                            connection.destroy();
+                            queue.delete(guildId);
+                        });
+                } catch {
+                    const q = queue.get(guildId);
+                    if (q) {
+                        for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
+                        if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
+                    }
+                    connection.destroy();
+                    queue.delete(guildId);
+                }
+            } else if (newS.status === VoiceConnectionStatus.Destroyed) {
+                const q = queue.get(guildId);
+                if (q) {
+                    for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
+                    if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
+                }
+                queue.delete(guildId);
+            }
+        });
+    }
+
+    console.log('[Estado] Esperando handshake de voz...');
+    let connected = false;
+    let conn = null;
+    const timeouts = [45000, 45000, 30000];
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            if (conn) {
+                try { conn.destroy(); } catch { }
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            console.log(`[Estado] Intento de handshake ${attempt}/3 (timeout: ${timeouts[attempt - 1] / 1000}s)...`);
+
+            conn = joinVoiceChannel({
+                channelId: vc.id,
+                guildId: guildId,
+                adapterCreator: adapterCreator,
+            });
+
+            applyVpsFix(conn);
+
+            await entersState(conn, VoiceConnectionStatus.Ready, timeouts[attempt - 1]);
+            console.log('[Estado] ¡Handshake OK!');
+            connected = true;
+            break;
+        } catch (e) {
+            console.error(`[Estado] Intento ${attempt} falló: ${e.message}`);
+        }
+    }
+
+    if (!connected) {
+        console.error('[Estado] Todos los intentos de handshake fallaron.');
+        if (conn) try { conn.destroy(); } catch { }
+        queue.delete(guildId);
+        return null;
+    }
+
+    qc.connection = conn;
+    conn.subscribe(qc.player);
+    return conn;
+}
+
+function attachPlayerHandlers(guildId, qc) {
+    qc.player.on('stateChange', (oldS, newS) => {
+        console.log(`[Reproductor] ${oldS.status} → ${newS.status}`);
+        if (newS.status === AudioPlayerStatus.Playing) {
+            const q = queue.get(guildId);
+            if (q) {
+                q.playStartTime = Date.now();
+                q._restarting = false;
+            }
+        }
+    });
+
+    qc.player.on(AudioPlayerStatus.Idle, () => {
+        const q = queue.get(guildId);
+        if (!q) return;
+
+        // Guarda: si playSong está reiniciando (seek/pitch/speed), ignorar este Idle
+        if (q._restarting) return;
+
+        // Matar proceso ffmpeg si existe
+        if (q.ffmpegProc) { try { q.ffmpegProc.kill(); } catch { } q.ffmpegProc = null; }
+
+        // Destruir el recurso de audio antiguo para matar el ffmpeg de prism-media
+        try {
+            const oldResource = q.player.state.resource;
+            if (oldResource) { oldResource.playStream?.destroy(); oldResource.encoder?.destroy(); }
+        } catch { }
+
+        // TTS terminó — limpiar temporal y reanudar música
+        if (q.ttsFile) {
+            safeDelete(q.ttsFile);
+            const resumePos = q.ttsResumeOffset != null ? q.ttsResumeOffset : 0;
+            q.ttsFile = null;
+            q.ttsResumeOffset = null;
+            if (q.songs.length > 0) {
+                // Reanudar música desde donde estaba antes del TTS
+                q.seekTo = resumePos;
+                playSong(guildId);
+            }
+            return;
+        }
+
+        // Bucle — repetir la misma canción
+        if (q.loop && q.songs.length > 0) {
+            q.seekTo = null;
+            playSong(guildId);
+            return;
+        }
+
+        // Guardar canción anterior para el botón de atrás
+        const finished = q.songs[0];
+        if (finished) {
+            q.previousSong = { title: finished.title, url: finished.url, duration: finished.duration, channel: finished.channel, source: finished.source, thumbnail: finished.thumbnail };
+        }
+        if (finished?.filePath) safeDelete(finished.filePath);
+
+        q.songs.shift();
+        if (q.songs.length > 0) {
+            playSong(guildId);
+        } else {
+            q.leaveTimeout = setTimeout(() => {
+                const stillQ = queue.get(guildId);
+                if (stillQ && stillQ.songs.length === 0) {
+                    stillQ.connection?.destroy();
+                    queue.delete(guildId);
+                    stillQ.textChannel.send({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setColor(THEME.muted)
+                                .setDescription('Cola terminada — saliendo del canal.')
+                        ]
+                    }).catch(() => { });
+                }
+            }, 120000);
+        }
+    });
+
+    qc.player.on('error', err => {
+        console.error('[Error de audio]:', err.message);
+        const q = queue.get(guildId);
+        if (q) {
+            if (q.songs[0]?.filePath) safeDelete(q.songs[0].filePath);
+            q.textChannel.send({ embeds: [errEmbed('Error de reproducción — saltando canción.')] }).catch(() => { });
+            q.songs.shift();
+            if (q.songs.length > 0) playSong(guildId);
+        }
+    });
+}
+
+// ─── Persistencia de reproducción (reanudar tras reinicio) ───────────
+const RESUME_MAX_AGE_MS = 2 * 60 * 60 * 1000; // No reanudar instantáneas de más de 2 h
+
+function fmtSecs(total) {
+    total = Math.max(0, Math.floor(total));
+    const m = Math.floor(total / 60), s = total % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function serializeSong(s) {
+    return { title: s.title, url: s.url, duration: s.duration, channel: s.channel, source: s.source, thumbnail: s.thumbnail };
+}
+
+// Guarda en Mongo la posición y la cola de cada servidor que esté reproduciendo.
+async function savePlaybackSnapshots() {
+    if (mongoose.connection.readyState !== 1) return;
+    try {
+        const activeGuildIds = [];
+        for (const [guildId, sq] of queue) {
+            if (!sq.connection || !sq.voiceChannel || !sq.songs || sq.songs.length === 0) continue;
+            activeGuildIds.push(guildId);
+            const position = Math.max(0, Math.floor(getCurrentPosition(sq)));
+            await PlaybackSnapshot.updateOne(
+                { guildId },
+                { $set: {
+                    guildId,
+                    voiceChannelId: sq.voiceChannel.id,
+                    textChannelId: sq.textChannel?.id || null,
+                    songs: sq.songs.map(serializeSong),
+                    position,
+                    volume: sq.volume, loop: sq.loop, speed: sq.speed, pitch: sq.pitch,
+                    savedAt: Date.now(),
+                } },
+                { upsert: true }
+            );
+        }
+        // Limpiar instantáneas de servidores que ya no están reproduciendo
+        await PlaybackSnapshot.deleteMany({ guildId: { $nin: activeGuildIds } });
+    } catch (e) {
+        console.error('[Reanudar] Falló al guardar instantáneas:', e.message);
+    }
+}
+
+// Al arrancar: leer instantáneas y reanudar cada sesión donde se quedó.
+async function restorePlaybackSnapshots() {
+    if (mongoose.connection.readyState !== 1) return;
+    let snaps;
+    try {
+        snaps = await PlaybackSnapshot.find({});
+    } catch (e) {
+        console.error('[Reanudar] Falló al leer instantáneas:', e.message);
+        return;
+    }
+    if (!snaps.length) return;
+    console.log(`[Reanudar] ${snaps.length} sesión(es) de reproducción para restaurar.`);
+    for (const snap of snaps) {
+        try {
+            if (Date.now() - (snap.savedAt || 0) > RESUME_MAX_AGE_MS || !snap.songs || snap.songs.length === 0) {
+                await PlaybackSnapshot.deleteOne({ guildId: snap.guildId });
+                continue;
+            }
+            await resumeFromSnapshot(snap);
+        } catch (e) {
+            console.error(`[Reanudar] Falló para ${snap.guildId}:`, e.message);
+        }
+    }
+}
+
+async function resumeFromSnapshot(snap) {
+    if (queue.has(snap.guildId)) return; // ya activo, no duplicar
+
+    const guild = await client.guilds.fetch(snap.guildId).catch(() => null);
+    if (!guild) return;
+    const vc = await client.channels.fetch(snap.voiceChannelId).catch(() => null);
+    if (!vc || !(vc.type === ChannelType.GuildVoice || vc.type === ChannelType.GuildStageVoice)) {
+        await PlaybackSnapshot.deleteOne({ guildId: snap.guildId });
+        return;
+    }
+    const textChannel = snap.textChannelId ? await client.channels.fetch(snap.textChannelId).catch(() => null) : null;
+
+    const qc = {
+        textChannel: textChannel || null,
+        voiceChannel: vc,
+        connection: null,
+        songs: snap.songs.map(serializeSong),
+        player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } }),
+        leaveTimeout: null,
+        loop: !!snap.loop,
+        volume: typeof snap.volume === 'number' ? snap.volume : 50,
+        speed: typeof snap.speed === 'number' ? snap.speed : 1.0,
+        pitch: typeof snap.pitch === 'number' ? snap.pitch : 1.0,
+        // Reanudar desde la posición guardada (el path de seek de playSong usa ffmpeg -ss)
+        seekTo: snap.position && snap.position > 1 ? snap.position : null,
+        ttsFile: null,
+        ffmpegProc: null,
+        playStartTime: null,
+        playStartOffset: 0,
+        previousSong: null,
+        nowPlayingMsg: null,
+    };
+    queue.set(snap.guildId, qc);
+
+    const conn = await connectVoice(snap.guildId, vc, qc, guild.voiceAdapterCreator);
+    if (!conn) {
+        console.error(`[Reanudar] No se pudo reconectar al canal de voz en ${guild.name}.`);
+        return; // connectVoice ya hizo queue.delete
+    }
+    attachPlayerHandlers(snap.guildId, qc);
+
+    const first = qc.songs[0];
+    if (textChannel) {
+        textChannel.send({
+            embeds: [new EmbedBuilder()
+                .setColor(THEME.primary)
+                .setAuthor({ name: '🔄 REANUDANDO TRAS REINICIO' })
+                .setDescription(`Continuando **${fmt(first.title, 60)}** desde \`${fmtSecs(qc.seekTo || 0)}\`.`)]
+        }).catch(() => { });
+    }
+    console.log(`[Reanudar] ${guild.name}: "${first.title}" desde ${qc.seekTo || 0}s (${qc.songs.length} en cola).`);
+    playSong(snap.guildId);
+}
+
 // ─── Comando Play ─────────────────────────────────────────────────
 async function execute(ctx, serverQueue, query) {
     const vc = ctx.member.voice?.channel;
@@ -1023,192 +1363,11 @@ async function execute(ctx, serverQueue, query) {
         queue.set(guildId, qc);
 
         try {
-            const sodium = require('libsodium-wrappers');
-            await sodium.ready;
-
-            function applyVpsFix(connection) {
-                // Solo manejar desconexiones DESPUÉS de que la conexión esté establecida
-                // para evitar destruirla durante el handshake UDP inicial
-                let fullyConnected = false;
-
-                connection.on('stateChange', (oldS, newS) => {
-                    console.log(`[Conn] ${oldS.status} → ${newS.status}`);
-
-                    // Limpiar keepAlive UDP (arreglo VPS para bucles de paquetes)
-                    const newNetworking = Reflect.get(newS, 'networking');
-                    if (newNetworking) {
-                        newNetworking.on('stateChange', (oldNS, newNS) => {
-                            const newUdp = Reflect.get(newNS, 'udp');
-                            clearInterval(newUdp?.keepAliveInterval);
-                        });
-                    }
-
-                    if (newS.status === VoiceConnectionStatus.Ready) {
-                        fullyConnected = true;
-                    }
-
-                    if (newS.status === VoiceConnectionStatus.Disconnected && fullyConnected) {
-                        try {
-                            entersState(connection, VoiceConnectionStatus.Connecting, 5000)
-                                .catch(() => {
-                                    const q = queue.get(guildId);
-                                    if (q) {
-                                        for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
-                                        if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
-                                        q.textChannel.send({
-                                            embeds: [new EmbedBuilder().setColor(THEME.danger).setDescription('Desconectado del canal de voz — cola vaciada.')]
-                                        }).catch(() => { });
-                                    }
-                                    connection.destroy();
-                                    queue.delete(guildId);
-                                });
-                        } catch {
-                            const q = queue.get(guildId);
-                            if (q) {
-                                for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
-                                if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
-                            }
-                            connection.destroy();
-                            queue.delete(guildId);
-                        }
-                    } else if (newS.status === VoiceConnectionStatus.Destroyed) {
-                        const q = queue.get(guildId);
-                        if (q) {
-                            for (const s of q.songs) { if (s.filePath) safeDelete(s.filePath); }
-                            if (q.leaveTimeout) clearTimeout(q.leaveTimeout);
-                        }
-                        queue.delete(guildId);
-                    }
-                });
-            }
-
-            console.log('[Estado] Esperando handshake de voz...');
-            let connected = false;
-            let conn = null;
-            const timeouts = [45000, 45000, 30000];
-
-            for (let attempt = 1; attempt <= 3; attempt++) {
-                try {
-                    if (conn) {
-                        try { conn.destroy(); } catch { }
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-
-                    console.log(`[Estado] Intento de handshake ${attempt}/3 (timeout: ${timeouts[attempt - 1] / 1000}s)...`);
-
-                    conn = joinVoiceChannel({
-                        channelId: vc.id,
-                        guildId: guildId,
-                        adapterCreator: ctx.guild.voiceAdapterCreator,
-                    });
-
-                    applyVpsFix(conn);
-
-                    await entersState(conn, VoiceConnectionStatus.Ready, timeouts[attempt - 1]);
-                    console.log('[Estado] ¡Handshake OK!');
-                    connected = true;
-                    break;
-                } catch (e) {
-                    console.error(`[Estado] Intento ${attempt} falló: ${e.message}`);
-                }
-            }
-
-            if (!connected) {
-                console.error('[Estado] Todos los intentos de handshake fallaron.');
-                if (conn) try { conn.destroy(); } catch { }
-                queue.delete(guildId);
+            const conn = await connectVoice(guildId, vc, qc, ctx.guild.voiceAdapterCreator);
+            if (!conn) {
                 return ctx.send({ embeds: [errEmbed('Falló la conexión de voz tras 3 intentos. Inténtalo de nuevo.')] });
             }
-
-            qc.connection = conn;
-            conn.subscribe(qc.player);
-
-            qc.player.on('stateChange', (oldS, newS) => {
-                console.log(`[Reproductor] ${oldS.status} → ${newS.status}`);
-                if (newS.status === AudioPlayerStatus.Playing) {
-                    const q = queue.get(guildId);
-                    if (q) {
-                        q.playStartTime = Date.now();
-                        q._restarting = false;
-                    }
-                }
-            });
-
-            qc.player.on(AudioPlayerStatus.Idle, () => {
-                const q = queue.get(guildId);
-                if (!q) return;
-
-                // Guarda: si playSong está reiniciando (seek/pitch/speed), ignorar este Idle
-                if (q._restarting) return;
-
-                // Matar proceso ffmpeg si existe
-                if (q.ffmpegProc) { try { q.ffmpegProc.kill(); } catch { } q.ffmpegProc = null; }
-
-                // Destruir el recurso de audio antiguo para matar el ffmpeg de prism-media
-                try {
-                    const oldResource = q.player.state.resource;
-                    if (oldResource) { oldResource.playStream?.destroy(); oldResource.encoder?.destroy(); }
-                } catch { }
-
-                // TTS terminó — limpiar temporal y reanudar música
-                if (q.ttsFile) {
-                    safeDelete(q.ttsFile);
-                    const resumePos = q.ttsResumeOffset != null ? q.ttsResumeOffset : 0;
-                    q.ttsFile = null;
-                    q.ttsResumeOffset = null;
-                    if (q.songs.length > 0) {
-                        // Reanudar música desde donde estaba antes del TTS
-                        q.seekTo = resumePos;
-                        playSong(guildId);
-                    }
-                    return;
-                }
-
-                // Bucle — repetir la misma canción
-                if (q.loop && q.songs.length > 0) {
-                    q.seekTo = null;
-                    playSong(guildId);
-                    return;
-                }
-
-                // Guardar canción anterior para el botón de atrás
-                const finished = q.songs[0];
-                if (finished) {
-                    q.previousSong = { title: finished.title, url: finished.url, duration: finished.duration, channel: finished.channel, source: finished.source, thumbnail: finished.thumbnail };
-                }
-                if (finished?.filePath) safeDelete(finished.filePath);
-
-                q.songs.shift();
-                if (q.songs.length > 0) {
-                    playSong(guildId);
-                } else {
-                    q.leaveTimeout = setTimeout(() => {
-                        const stillQ = queue.get(guildId);
-                        if (stillQ && stillQ.songs.length === 0) {
-                            stillQ.connection?.destroy();
-                            queue.delete(guildId);
-                            stillQ.textChannel.send({
-                                embeds: [
-                                    new EmbedBuilder()
-                                        .setColor(THEME.muted)
-                                        .setDescription('Cola terminada — saliendo del canal.')
-                                ]
-                            }).catch(() => { });
-                        }
-                    }, 120000);
-                }
-            });
-
-            qc.player.on('error', err => {
-                console.error('[Error de audio]:', err.message);
-                const q = queue.get(guildId);
-                if (q) {
-                    if (q.songs[0]?.filePath) safeDelete(q.songs[0].filePath);
-                    q.textChannel.send({ embeds: [errEmbed('Error de reproducción — saltando canción.')] }).catch(() => { });
-                    q.songs.shift();
-                    if (q.songs.length > 0) playSong(guildId);
-                }
-            });
+            attachPlayerHandlers(guildId, qc);
 
             // Borrar la respuesta 'Cargando...' del slash antes de reproducir
             if (ctx.isSlash && ctx.deleteReply) ctx.deleteReply();
@@ -2544,5 +2703,25 @@ client.on('interactionCreate', async (interaction) => {
         else interaction.reply(payload).catch(() => { });
     }
 });
+
+// ─── Apagado ordenado: guardar la posición de reproducción antes de salir ──
+// docker-compose restart/stop envía SIGTERM; guardamos la instantánea para que
+// la música se reanude donde estaba al volver a arrancar.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Apagado] Señal ${signal} — guardando estado de reproducción...`);
+    try {
+        await savePlaybackSnapshots();
+        console.log('[Apagado] Instantáneas guardadas.');
+    } catch (e) {
+        console.error('[Apagado] Falló al guardar:', e.message);
+    }
+    try { await mongoose.connection.close(); } catch { }
+    process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 client.login(TOKEN);

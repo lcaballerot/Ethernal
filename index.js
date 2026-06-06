@@ -263,6 +263,10 @@ client.once('ready', async () => {
             setInterval(() => { savePlaybackSnapshots().catch(() => { }); }, 15000);
         });
 
+    // ─── Rellenar la caché de mensajes recientes tras el arranque ──
+    // Así, los mensajes enviados ANTES del reinicio también pueden registrarse al borrarse.
+    backfillMessageCache().catch(e => console.error('[Caché] Error en backfill:', e.message));
+
     // ─── Limpieza periódica de temporales (cada 30 min) ──────────
     setInterval(() => {
         try {
@@ -2316,6 +2320,28 @@ client.on('messageCreate', (message) => {
     if (!message.guild || message.author?.bot) return;
     cacheMessage(message);
 });
+
+// Al arrancar, traer los mensajes recientes de cada canal legible y cachearlos,
+// para poder registrar el borrado de mensajes enviados ANTES del reinicio.
+async function backfillMessageCache() {
+    if (mongoose.connection.readyState !== 1) return;
+    let total = 0, channels = 0;
+    for (const guild of client.guilds.cache.values()) {
+        for (const channel of guild.channels.cache.values()) {
+            if (!channel?.isTextBased?.() || !channel.viewable) continue;
+            try {
+                const msgs = await channel.messages.fetch({ limit: 100 });
+                channels++;
+                for (const msg of msgs.values()) {
+                    if (!msg.author || msg.author.bot) continue;
+                    cacheMessage(msg);
+                    total++;
+                }
+            } catch { /* sin permiso de leer el historial, canal vacío, etc. */ }
+        }
+    }
+    if (total) console.log(`[Caché] Backfill: ${total} mensajes de ${channels} canal(es) cacheados tras el arranque.`);
+}
 
 // 1. Mensaje borrado
 client.on('messageDelete', async (message) => {

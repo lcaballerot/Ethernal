@@ -43,6 +43,21 @@ const playbackSnapshotSchema = new mongoose.Schema({
 }, { minimize: false });
 const PlaybackSnapshot = mongoose.model('PlaybackSnapshot', playbackSnapshotSchema);
 
+// Caché de mensajes persistente (para deletes/edits que sobreviven a reinicios).
+// TTL: los documentos se borran solos al llegar su expireAt.
+const cachedMessageSchema = new mongoose.Schema({
+    messageId: { type: String, required: true, unique: true },
+    guildId: String,
+    channelId: String,
+    authorId: String,
+    authorTag: String,
+    authorBot: { type: Boolean, default: false },
+    content: { type: String, default: '' },
+    attachments: { type: Array, default: [] },
+    expireAt: { type: Date, index: { expires: 0 } },
+});
+const CachedMessage = mongoose.model('CachedMessage', cachedMessageSchema);
+
 
 
 // Multiplataforma: binarios incluidos en Windows, binarios del sistema en Linux
@@ -2210,40 +2225,159 @@ function getPermissionOverwritesDiff(oldChannel, newChannel) {
     return diffs;
 }
 
-// ─── Caché de mensajes (para deletes/edits rápidos) ───
+// ─── Caché de mensajes (para deletes/edits) ───
+// Doble nivel: Map en memoria (rápido) + Mongo (sobrevive a reinicios).
 const modMessageCache = new Map();
 const MOD_MAX_CACHE = 5000;
-client.on('messageCreate', (message) => {
-    if (!message.guild || message.author?.bot) return;
+const MSG_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 días
+
+function cacheMessage(message) {
+    if (!message.guild || !message.author) return;
+    const attachments = message.attachments?.map
+        ? message.attachments.map(a => ({ name: a.name, url: a.url }))
+        : [];
     modMessageCache.set(message.id, {
-        content: message.content, author: message.author, channel: message.channel,
-        attachments: message.attachments.map(a => ({ name: a.name, url: a.url })),
+        content: message.content || '',
+        author: message.author,
+        authorBot: !!message.author.bot,
+        channel: message.channel,
+        attachments,
     });
     if (modMessageCache.size > MOD_MAX_CACHE) modMessageCache.delete(modMessageCache.keys().next().value);
+
+    // Respaldo en Mongo (fire-and-forget) para que persista entre reinicios
+    if (mongoose.connection.readyState === 1) {
+        CachedMessage.updateOne(
+            { messageId: message.id },
+            { $set: {
+                messageId: message.id,
+                guildId: message.guild.id,
+                channelId: message.channel?.id,
+                authorId: message.author.id,
+                authorTag: message.author.tag,
+                authorBot: !!message.author.bot,
+                content: (message.content || '').substring(0, 4000),
+                attachments: attachments.slice(0, 10),
+                expireAt: new Date(Date.now() + MSG_CACHE_TTL_MS),
+            } },
+            { upsert: true }
+        ).catch(() => { });
+    }
+}
+
+// Recupera los datos de un mensaje borrado: memoria → objeto parcial de discord.js → Mongo.
+async function recoverMessage(message) {
+    const mem = modMessageCache.get(message.id);
+    if (mem) {
+        modMessageCache.delete(message.id);
+        return {
+            authorId: mem.author?.id, authorTag: mem.author?.tag,
+            authorBot: mem.authorBot ?? mem.author?.bot,
+            content: mem.content, attachments: mem.attachments || [], userObj: mem.author,
+        };
+    }
+    if (message.author || message.content) {
+        const atts = message.attachments?.size
+            ? Array.from(message.attachments.values()).map(a => ({ name: a.name, url: a.url }))
+            : [];
+        return {
+            authorId: message.author?.id, authorTag: message.author?.tag,
+            authorBot: message.author?.bot, content: message.content,
+            attachments: atts, userObj: message.author || null,
+        };
+    }
+    if (mongoose.connection.readyState === 1) {
+        const doc = await CachedMessage.findOne({ messageId: message.id }).catch(() => null);
+        if (doc) {
+            CachedMessage.deleteOne({ messageId: message.id }).catch(() => { });
+            return {
+                authorId: doc.authorId, authorTag: doc.authorTag, authorBot: doc.authorBot,
+                content: doc.content, attachments: doc.attachments || [], userObj: null,
+            };
+        }
+    }
+    return null;
+}
+
+client.on('messageCreate', (message) => {
+    if (!message.guild || message.author?.bot) return;
+    cacheMessage(message);
 });
 
 // 1. Mensaje borrado
 client.on('messageDelete', async (message) => {
-    if (!message.guild || message.author?.bot) return;
-    const logChannel = await getLoggingChannel(message.guild, 'msg');
+    // Resolver el servidor aunque el mensaje sea parcial (no cacheado)
+    let guild = message.guild;
+    if (!guild && message.guildId) guild = await client.guilds.fetch(message.guildId).catch(() => null);
+    if (!guild) return;
+
+    const rec = await recoverMessage(message);
+    if (rec?.authorBot) return; // no registrar borrados de bots
+
+    const logChannel = await getLoggingChannel(guild, 'msg');
     if (!logChannel) return;
-    let author = message.author, content = message.content, attachments = message.attachments;
-    const cached = modMessageCache.get(message.id);
-    if (cached) { author = cached.author; content = cached.content; attachments = cached.attachments; modMessageCache.delete(message.id); }
-    const authorDisplay = author ? `${author} (\`${author.id}\`)` : 'Autor desconocido (sin caché)';
-    const auditEntry = await getAuditLogEntry(message.guild, AuditLogEvent.MessageDelete, author?.id);
+
+    const channelMention = message.channel ? `${message.channel}` : (message.channelId ? `<#${message.channelId}>` : 'Desconocido');
+    const authorDisplay = rec?.authorId
+        ? `<@${rec.authorId}> (\`${rec.authorId}\`)${rec.authorTag ? ` · \`${rec.authorTag}\`` : ''}`
+        : 'Autor desconocido (mensaje no cacheado)';
+
+    // Quién lo borró: el audit log de Discord solo crea una entrada cuando lo
+    // borra OTRA persona/bot — los autoborrados no generan entrada. Con reintentos
+    // por el retardo del audit log.
+    const auditEntry = await getAuditLogEntry(guild, AuditLogEvent.MessageDelete, rec?.authorId, 7000, 2);
     const deletedBy = auditEntry ? auditEntry.executor : null;
+
+    const content = rec?.content;
     const embed = modEmbed('🗑️ Mensaje Borrado',
-        `**Autor**: ${authorDisplay}\n**Canal**: ${message.channel}\n` +
-        `**Borrado por**: ${deletedBy ? `${deletedBy} (\`${deletedBy.id}\`)` : 'Autor (propio/app)'}\n` +
-        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n**Contenido**:\n${content ? content.substring(0, 1500) : '*Sin caché o vacío*'}`,
+        `**Autor**: ${authorDisplay}\n**Canal**: ${channelMention}\n` +
+        `**Borrado por**: ${deletedBy ? `${deletedBy} (\`${deletedBy.id}\`)` : 'El propio autor (o la app)'}\n` +
+        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n**Contenido**:\n${content ? content.substring(0, 1500) : '*No disponible — mensaje anterior al último arranque del bot*'}`,
         MODC.RED);
-    if (author) embed.setThumbnail(author.displayAvatarURL({ dynamic: true }));
-    if (attachments && (attachments.size > 0 || attachments.length > 0)) {
-        const list = Array.isArray(attachments) ? attachments : Array.from(attachments.values());
-        embed.addFields({ name: 'Adjuntos', value: list.map(a => `[${a.name}](${a.url})`).join(', ').substring(0, 1024) });
+
+    if (rec?.userObj) {
+        embed.setThumbnail(rec.userObj.displayAvatarURL({ dynamic: true }));
+    } else if (rec?.authorId) {
+        const u = await client.users.fetch(rec.authorId).catch(() => null);
+        if (u) embed.setThumbnail(u.displayAvatarURL({ dynamic: true }));
+    }
+    if (rec?.attachments?.length) {
+        embed.addFields({ name: 'Adjuntos', value: rec.attachments.map(a => `[${a.name}](${a.url})`).join(', ').substring(0, 1024) });
     }
     logChannel.send({ embeds: [embed] }).catch(console.error);
+});
+
+// 1b. Borrado masivo de mensajes (purga) — antes no se registraba
+client.on('messageDeleteBulk', async (messages, channel) => {
+    let guild = channel?.guild;
+    if (!guild && messages.first()?.guildId) guild = await client.guilds.fetch(messages.first().guildId).catch(() => null);
+    if (!guild) return;
+    const logChannel = await getLoggingChannel(guild, 'msg');
+    if (!logChannel) return;
+
+    // Recuperar lo que se pueda de cada mensaje (en orden cronológico)
+    const ordered = Array.from(messages.values()).reverse();
+    const lines = [];
+    for (const msg of ordered) {
+        const rec = await recoverMessage(msg);
+        if (rec?.authorBot) continue;
+        const who = rec?.authorTag || (rec?.authorId ? rec.authorId : 'desconocido');
+        const text = rec?.content ? rec.content.replace(/\n/g, ' ').substring(0, 120) : '*sin caché*';
+        lines.push(`• **${who}**: ${text}`);
+    }
+
+    const auditEntry = await getAuditLogEntry(guild, AuditLogEvent.MessageBulkDelete, channel?.id, 10000, 2);
+    const deletedBy = auditEntry ? auditEntry.executor : null;
+
+    const channelMention = channel ? `${channel}` : 'Desconocido';
+    let body = `**Cantidad**: \`${messages.size}\` mensaje(s)\n**Canal**: ${channelMention}\n` +
+        `**Borrado por**: ${deletedBy ? `${deletedBy} (\`${deletedBy.id}\`)` : 'Desconocido'}\n` +
+        `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n`;
+    const joined = lines.join('\n');
+    body += joined ? `**Mensajes** (los que había en caché):\n${joined}` : '*Ningún contenido en caché (mensajes anteriores al último arranque del bot).*';
+    if (body.length > 4000) body = body.substring(0, 3960) + '\n*(…lista truncada)*';
+
+    logChannel.send({ embeds: [modEmbed('🧹 Purga de Mensajes', body, MODC.RED)] }).catch(console.error);
 });
 
 // 2. Mensaje editado
@@ -2251,23 +2385,35 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     const guild = newMessage.guild || oldMessage.guild;
     if (!guild) return;
     const author = newMessage.author || oldMessage.author;
-    if (!author || author.bot) return;
-    if (oldMessage.content === newMessage.content) return;
+    if (author?.bot) return; // saltar borrados/ediciones de bots conocidos
+
+    // Recuperar el contenido anterior (parcial → memoria → Mongo)
+    let oldContent = oldMessage.content;
+    if (!oldContent) {
+        const cached = modMessageCache.get(oldMessage.id);
+        if (cached?.content) oldContent = cached.content;
+        else if (mongoose.connection.readyState === 1) {
+            const doc = await CachedMessage.findOne({ messageId: oldMessage.id }).catch(() => null);
+            if (doc?.content) oldContent = doc.content;
+        }
+    }
+
+    // Si confirmamos que el contenido no cambió (p.ej. unfurl de enlaces), no registrar
+    if (oldContent != null && oldContent === newMessage.content) return;
+
     const logChannel = await getLoggingChannel(guild, 'msg');
     if (!logChannel) return;
-    let oldContent = oldMessage.content;
-    const cached = modMessageCache.get(oldMessage.id);
-    if (cached && !oldContent) oldContent = cached.content;
-    modMessageCache.set(newMessage.id, {
-        content: newMessage.content, author, channel: newMessage.channel || oldMessage.channel,
-        attachments: newMessage.attachments.map(a => ({ name: a.name, url: a.url })),
-    });
+
+    // Mantener la caché actualizada con el contenido nuevo
+    if (newMessage.author) cacheMessage(newMessage);
+
+    const authorDisplay = author ? `${author} (\`${author.id}\`)` : 'Autor desconocido';
     const embed = modEmbed('✏️ Mensaje Editado',
-        `**Autor**: ${author} (\`${author.id}\`)\n**Canal**: ${newMessage.channel || oldMessage.channel}\n` +
+        `**Autor**: ${authorDisplay}\n**Canal**: ${newMessage.channel || oldMessage.channel}\n` +
         `**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n**Enlace**: [Ir al mensaje](${newMessage.url})\n\n` +
-        `**Antes**:\n${oldContent ? oldContent.substring(0, 1000) : '*Sin caché*'}\n\n**Después**:\n${newMessage.content ? newMessage.content.substring(0, 1000) : '*Vacío*'}`,
+        `**Antes**:\n${oldContent ? oldContent.substring(0, 1000) : '*No disponible*'}\n\n**Después**:\n${newMessage.content ? newMessage.content.substring(0, 1000) : '*Vacío*'}`,
         MODC.ORANGE);
-    embed.setThumbnail(author.displayAvatarURL({ dynamic: true }));
+    if (author) embed.setThumbnail(author.displayAvatarURL({ dynamic: true }));
     logChannel.send({ embeds: [embed] }).catch(console.error);
 });
 

@@ -196,6 +196,13 @@ const slashCommands = [
         .addUserOption(o => o.setName('target').setDescription('Miembro a reactivar').setRequired(true))
         .addStringOption(o => o.setName('reason').setDescription('Razón').setRequired(false)),
     new SlashCommandBuilder().setName('toggle-greets').setDescription('Activa o desactiva los mensajes de bienvenida públicos en este canal'),
+    new SlashCommandBuilder().setName('autorol').setDescription('Configura qué roles se asignan automáticamente al entrar al servidor')
+        .addSubcommand(s => s.setName('users').setDescription('Establece el rol que se da a los usuarios al entrar')
+            .addRoleOption(o => o.setName('rol').setDescription('Rol para los usuarios').setRequired(true)))
+        .addSubcommand(s => s.setName('bots').setDescription('Establece el rol que se da a los bots al entrar')
+            .addRoleOption(o => o.setName('rol').setDescription('Rol para los bots').setRequired(true)))
+        .addSubcommand(s => s.setName('on').setDescription('Activa la asignación automática de roles'))
+        .addSubcommand(s => s.setName('off').setDescription('Desactiva la asignación automática de roles')),
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
@@ -2053,15 +2060,21 @@ const MOD_ROLES = {
     CO_OWNER: '1511375931564888214',
 };
 
-// Auto-asignación de roles al entrar
-const AUTO_ROLES = {
-    USUARIOS: '1511404537120817334',       // humanos
-    ETHERNAL_BOTS: '1511404539624947823',  // bots
-};
+// Configuración de auto-rol por servidor — persistida en MongoDB, por lo que
+// sobrevive a los reinicios del bot (recuerda los roles de usuarios/bots y el on/off).
+// SIN valores por defecto: los roles deben asignarse con /autorol users|bots
+// y la asignación debe activarse con /autorol on.
+const autoRoleConfigSchema = new mongoose.Schema({
+    guildId: { type: String, required: true, unique: true },
+    userRoleId: { type: String, default: null },
+    botRoleId: { type: String, default: null },
+    enabled: { type: Boolean, default: false },
+});
+const AutoRoleConfig = mongoose.model('AutoRoleConfig', autoRoleConfigSchema);
 
 const MODC = { GREEN: 0x9B59B6, RED: 0x8B0000, ORANGE: 0xFF8008, PURPLE: 0x8A2387, BLUE: 0x4E65FF };
 const WARNING_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // los avisos expiran a los 7 días
-const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute', 'toggle-greets']);
+const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute', 'toggle-greets', 'autorol']);
 
 // ─── Persistencia de avisos / watchlist en MongoDB ───
 const warningSchema = new mongoose.Schema({
@@ -2421,17 +2434,25 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 client.on('guildMemberAdd', async (member) => {
     const logChannel = await getLoggingChannel(member.guild, 'join_leave');
     const isBot = member.user.bot;
-    const roleIdToAssign = isBot ? AUTO_ROLES.ETHERNAL_BOTS : AUTO_ROLES.USUARIOS;
-    const roleName = isBot ? 'Ethernal Bots' : 'Usuarios';
+
+    // Auto-rol configurable y persistente (/autorol). Sin configuración no se asigna nada.
+    const arc = await AutoRoleConfig.findOne({ guildId: member.guild.id }).catch(() => null);
+    const autoRoleEnabled = !!(arc && arc.enabled);
+    const roleIdToAssign = isBot ? arc?.botRoleId : arc?.userRoleId;
     let roleGranted = false, roleError = null;
-    try {
-        if (member.guild.members.me.permissions.has(PermissionFlagsBits.ManageRoles)) {
-            await member.roles.add(roleIdToAssign); roleGranted = true;
-        } else roleError = 'El bot no tiene permiso de Gestionar Roles';
-    } catch (err) { roleError = err.message; }
-    if (roleGranted) {
-        await sendAdminLog(member.guild, modEmbed('🛡️ Rol Concedido',
-            `**Rol**: <@&${roleIdToAssign}>\n**Objetivo**: ${member.user}\n**Moderador**: <@${client.user.id}>\n**ID de Rol**: ${roleIdToAssign}`, MODC.GREEN));
+    if (autoRoleEnabled && roleIdToAssign) {
+        try {
+            if (member.guild.members.me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+                await member.roles.add(roleIdToAssign); roleGranted = true;
+            } else roleError = 'El bot no tiene permiso de Gestionar Roles';
+        } catch (err) { roleError = err.message; }
+        if (roleGranted) {
+            await sendAdminLog(member.guild, modEmbed('🛡️ Rol Concedido',
+                `**Rol**: <@&${roleIdToAssign}>\n**Objetivo**: ${member.user}\n**Moderador**: <@${client.user.id}>\n**ID de Rol**: ${roleIdToAssign}`, MODC.GREEN));
+        } else if (roleError) {
+            await sendAdminLog(member.guild, modEmbed('⚠️ Auto-rol falló',
+                `**Objetivo**: ${member.user}\n**Rol**: <@&${roleIdToAssign}>\n**Motivo**: ${roleError}`, MODC.ORANGE));
+        }
     }
 
     // Estado del toggle de bienvenidas: gobierna tanto el saludo público
@@ -2469,7 +2490,7 @@ client.on('guildMemberAdd', async (member) => {
         { name: 'Usuario', value: member.user.tag, inline: true },
         { name: 'ID', value: `\`${member.id}\``, inline: true },
         { name: 'Cuenta Creada', value: `${member.user.createdAt.toUTCString()} (hace ${humanizeDuration(ageMs)})` },
-        { name: 'Auto-Rol', value: roleGranted ? `✅ Rol **${roleName}** concedido.` : `❌ Falló **${roleName}**: ${roleError || 'Desconocido'}` },
+        { name: 'Auto-Rol', value: !autoRoleEnabled ? '⏸️ Desactivado' : (!roleIdToAssign ? '➖ Sin rol configurado para este tipo' : (roleGranted ? `✅ Rol <@&${roleIdToAssign}> concedido.` : `❌ Falló <@&${roleIdToAssign}>: ${roleError || 'Desconocido'}`)) },
     ]);
     if (!isBot && ageMs < 1000 * 60 * 60 * 24 * 3) embed.addFields({ name: '⚠️ Alerta', value: '¡Esta cuenta fue creada hace muy poco!' });
     logChannel.send({ embeds: [embed] }).catch(console.error);
@@ -2840,6 +2861,46 @@ client.on('interactionCreate', async (interaction) => {
             } else {
                 const embed = modEmbed('📥 Mensajes de Bienvenida', 'Se han **desactivado** los mensajes de bienvenida públicos en este servidor.', MODC.RED);
                 await interaction.reply({ embeds: [embed] });
+            }
+        }
+        else if (commandName === 'autorol') {
+            const sub = options.getSubcommand();
+            let cfg = await AutoRoleConfig.findOne({ guildId: guild.id });
+            if (!cfg) cfg = await AutoRoleConfig.create({ guildId: guild.id });
+
+            // Comprueba si el bot podrá asignar el rol elegido (no bloquea: solo avisa)
+            const checkAssignable = (role) => {
+                const me = guild.members.me;
+                if (role.id === guild.id) return 'No puedes usar @everyone como auto-rol.';
+                if (role.managed) return 'Ese rol lo gestiona una integración y no puede asignarse manualmente.';
+                if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return 'El bot no tiene el permiso **Gestionar Roles**.';
+                if (role.position >= me.roles.highest.position) return 'Ese rol está por encima (o al mismo nivel) del rol más alto del bot; muévelo por debajo del rol del bot para que pueda asignarlo.';
+                return null;
+            };
+
+            if (sub === 'users' || sub === 'bots') {
+                const role = options.getRole('rol');
+                const problem = checkAssignable(role);
+                if (sub === 'users') cfg.userRoleId = role.id; else cfg.botRoleId = role.id;
+                await cfg.save();
+                const label = sub === 'users' ? 'Usuarios' : 'Bots';
+                let desc = `Los nuevos **${label.toLowerCase()}** recibirán el rol <@&${role.id}> al entrar al servidor.`;
+                if (!cfg.enabled) desc += '\n\n⏸️ El auto-rol está **desactivado** ahora mismo. Usa `/autorol on` para activarlo.';
+                if (problem) desc += `\n\n⚠️ **Atención**: ${problem}`;
+                return interaction.reply({ embeds: [modEmbed(`🛡️ Auto-rol · ${label}`, desc, problem ? MODC.ORANGE : MODC.GREEN)] });
+            }
+            else if (sub === 'on') {
+                cfg.enabled = true;
+                await cfg.save();
+                const desc = 'La asignación automática de roles está **activada**.\n\n' +
+                    `• **Usuarios** → ${cfg.userRoleId ? `<@&${cfg.userRoleId}>` : '*(sin definir — usa `/autorol users`)*'}\n` +
+                    `• **Bots** → ${cfg.botRoleId ? `<@&${cfg.botRoleId}>` : '*(sin definir — usa `/autorol bots`)*'}`;
+                return interaction.reply({ embeds: [modEmbed('✅ Auto-rol Activado', desc, MODC.GREEN)] });
+            }
+            else if (sub === 'off') {
+                cfg.enabled = false;
+                await cfg.save();
+                return interaction.reply({ embeds: [modEmbed('⏸️ Auto-rol Desactivado', 'Los nuevos miembros **ya no** recibirán roles automáticamente al entrar.', MODC.RED)] });
             }
         }
     } catch (err) {

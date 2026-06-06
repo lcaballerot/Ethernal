@@ -1995,16 +1995,21 @@ async function sendAdminLog(guild, embed) {
     catch (err) { console.error('[Mod] Falló admin-log:', err.message); }
 }
 
-async function getAuditLogEntry(guild, actionType, targetId = null, maxTimeDiffMs = 7000) {
-    try {
-        if (!guild.members.me?.permissions.has(PermissionFlagsBits.ViewAuditLog)) return null;
-        const logs = await guild.fetchAuditLogs({ limit: 5, type: actionType });
-        const now = Date.now();
-        for (const entry of logs.entries.values()) {
-            if (targetId && entry.target && entry.target.id !== targetId) continue;
-            if (now - entry.createdTimestamp < maxTimeDiffMs) return entry;
-        }
-    } catch (e) { console.error('[Mod] Falló audit log:', e.message); }
+async function getAuditLogEntry(guild, actionType, targetId = null, maxTimeDiffMs = 7000, retries = 0, retryDelayMs = 1200) {
+    if (!guild.members.me?.permissions.has(PermissionFlagsBits.ViewAuditLog)) return null;
+    // El audit log de Discord es eventualmente consistente: el evento de gateway
+    // suele llegar antes de que la entrada esté disponible, por eso reintentamos.
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const logs = await guild.fetchAuditLogs({ limit: 5, type: actionType });
+            const now = Date.now();
+            for (const entry of logs.entries.values()) {
+                if (targetId && entry.target && entry.target.id !== targetId) continue;
+                if (now - entry.createdTimestamp < maxTimeDiffMs) return entry;
+            }
+        } catch (e) { console.error('[Mod] Falló audit log:', e.message); }
+        if (attempt < retries) await new Promise(r => setTimeout(r, retryDelayMs));
+    }
     return null;
 }
 
@@ -2334,18 +2339,20 @@ client.on('channelCreate', async (channel) => {
     if (!channel.guild) return;
     const logChannel = await getLoggingChannel(channel.guild, 'admin');
     if (!logChannel) return;
-    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
+    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id, 7000, 2);
+    const modLine = entry ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '';
     logChannel.send({ embeds: [modEmbed('🆕 Canal Creado',
         `**Canal**: ${channel} (\`#${channel.name}\`)\n**Tipo**: \`${ChannelType[channel.type] || 'Desconocido'}\`\n**Categoría**: ${channel.parent ? channel.parent.name : 'Ninguna'}\n` +
-        `**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.GREEN)] }).catch(console.error);
+        `${modLine}**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.GREEN)] }).catch(console.error);
 });
 client.on('channelDelete', async (channel) => {
     if (!channel.guild) return;
     const logChannel = await getLoggingChannel(channel.guild, 'admin');
     if (!logChannel) return;
-    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
+    const entry = await getAuditLogEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id, 7000, 2);
+    const modLine = entry ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '';
     logChannel.send({ embeds: [modEmbed('🗑️ Canal Eliminado',
-        `**Nombre**: \`${channel.name}\`\n**Tipo**: \`${ChannelType[channel.type] || 'Desconocido'}\`\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.RED)] }).catch(console.error);
+        `**Nombre**: \`${channel.name}\`\n**Tipo**: \`${ChannelType[channel.type] || 'Desconocido'}\`\n${modLine}**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>`, MODC.RED)] }).catch(console.error);
 });
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (!oldChannel.guild) return;
@@ -2364,12 +2371,14 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     const overwrites = getPermissionOverwritesDiff(oldChannel, newChannel);
     if (overwrites.length) { body += `🔒 **Permisos actualizados**:\n${overwrites.join('\n')}\n\n`; changed = true; }
     if (!changed) return;
-    // Buscar al responsable en varios tipos de auditoría (mover/editar = ChannelUpdate; sync de permisos = ChannelOverwrite*)
-    let entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+    // Buscar al responsable en varios tipos de auditoría (mover/editar = ChannelUpdate; sync de permisos = ChannelOverwrite*).
+    // Un reintento en el primer intento cubre el retardo del audit log de Discord.
+    let entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id, 7000, 2);
     if (!entry) entry = await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteUpdate, newChannel.id)
         || await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteCreate, newChannel.id)
         || await getAuditLogEntry(newChannel.guild, AuditLogEvent.ChannelOverwriteDelete, newChannel.id);
-    const desc = `**Canal**: ${newChannel} (\`#${newChannel.name}\`)\n**Moderador**: ${entry ? `${entry.executor} (\`${entry.executor.id}\`)` : 'Desconocido'}\n**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n` + body;
+    const modLine = entry ? `**Moderador**: ${entry.executor} (\`${entry.executor.id}\`)\n` : '';
+    const desc = `**Canal**: ${newChannel} (\`#${newChannel.name}\`)\n${modLine}**Hora**: <t:${Math.floor(Date.now() / 1000)}:f>\n\n` + body;
     if (desc.length <= 4000) logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc, MODC.ORANGE)] }).catch(console.error);
     else logChannel.send({ embeds: [modEmbed('⚙️ Canal Actualizado', desc.substring(0, 3800) + '\n*(continúa...)*', MODC.ORANGE), modEmbed('⚙️ Canal Actualizado (2)', '*(...)*\n\n' + desc.substring(3800), MODC.ORANGE)] }).catch(console.error);
 });

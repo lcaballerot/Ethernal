@@ -203,6 +203,15 @@ const slashCommands = [
             .addRoleOption(o => o.setName('rol').setDescription('Rol para los bots').setRequired(true)))
         .addSubcommand(s => s.setName('on').setDescription('Activa la asignación automática de roles'))
         .addSubcommand(s => s.setName('off').setDescription('Desactiva la asignación automática de roles')),
+    new SlashCommandBuilder().setName('antispam').setDescription('Activa o desactiva el filtro anti-spam del servidor')
+        .addStringOption(o => o
+            .setName('accion')
+            .setDescription('Activar o desactivar el anti-spam')
+            .setRequired(true)
+            .addChoices(
+                { name: 'on',  value: 'on'  },
+                { name: 'off', value: 'off' }
+            )),
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
@@ -2078,7 +2087,222 @@ const AutoRoleConfig = mongoose.model('AutoRoleConfig', autoRoleConfigSchema);
 
 const MODC = { GREEN: 0x9B59B6, RED: 0x8B0000, ORANGE: 0xFF8008, PURPLE: 0x8A2387, BLUE: 0x4E65FF };
 const WARNING_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // los avisos expiran a los 7 días
-const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute', 'toggle-greets', 'autorol']);
+const MOD_COMMANDS = new Set(['warn', 'warnings', 'clear-warnings', 'kick', 'ban', 'mute', 'unmute', 'toggle-greets', 'autorol', 'antispam']);
+
+// ─── Anti-spam ────────────────────────────────────────────────────
+// Configuración por servidor: persistida en MongoDB, cacheada en memoria
+// para que no haya ninguna consulta a DB en el camino crítico de cada mensaje.
+const antispamConfigSchema = new mongoose.Schema({
+    guildId: { type: String, required: true, unique: true },
+    enabled: { type: Boolean, default: false },
+});
+const AntispamConfig = mongoose.model('AntispamConfig', antispamConfigSchema);
+
+// ── Caché de configuración por servidor (TTL 60s) ─────────────────
+// Clave: guildId  →  { enabled: bool, fetchedAt: timestamp }
+const antispamCache = new Map();
+const ANTISPAM_CACHE_TTL = 60_000; // refrescar cada 60 s
+
+function antispamEnabled(guildId) {
+    const cached = antispamCache.get(guildId);
+    if (cached && Date.now() - cached.fetchedAt < ANTISPAM_CACHE_TTL) return cached.enabled;
+    return null; // necesita refrescar
+}
+
+async function refreshAntispamCache(guildId) {
+    try {
+        const doc = await AntispamConfig.findOne({ guildId }).lean();
+        const enabled = !!(doc && doc.enabled);
+        antispamCache.set(guildId, { enabled, fetchedAt: Date.now() });
+        return enabled;
+    } catch {
+        return false;
+    }
+}
+
+// ── Tracker de mensajes por usuario por servidor ──────────────────
+// Map<guildId, Map<userId, { msgs: [{content, attCount, ts}], purging: bool }>>
+const spamTracker = new Map();
+
+// ── Estadísticas de sesión por servidor ───────────────────────────
+// Se reinician al activar el anti-spam y se usan para generar el informe al desactivarlo.
+// Map<guildId, { total: number, startedAt: number, byUser: Map<userId, number>, byReason: Map<reason, number> }>
+const antispamStats = new Map();
+
+function getOrCreateStats(guildId) {
+    if (!antispamStats.has(guildId)) {
+        antispamStats.set(guildId, {
+            total: 0,
+            startedAt: Date.now(),
+            byUser: new Map(),
+            byReason: new Map(),
+        });
+    }
+    return antispamStats.get(guildId);
+}
+
+function recordSpamStat(guildId, userId, reason) {
+    const s = getOrCreateStats(guildId);
+    s.total++;
+    s.byUser.set(userId, (s.byUser.get(userId) || 0) + 1);
+    s.byReason.set(reason, (s.byReason.get(reason) || 0) + 1);
+}
+
+// ── Límites ───────────────────────────────────────────────────────
+const SPAM_WINDOW_MS    = 4000;  // ventana de 4 s
+const SPAM_MAX_MSGS     = 3;     // ≥ 3 mensajes en la ventana → flood
+const ALL_CAPS_MIN_LEN  = 6;     // mínimo de letras para detectar MAYÚSCULAS
+const MAX_USER_PINGS    = 3;     // más de 3 pings de usuario → eliminar
+// Umbral de similitud para detectar spam "casi duplicado"
+// (cuántos caracteres del nuevo mensaje deben coincidir con uno anterior)
+const SIMILAR_RATIO     = 0.85;
+
+// ── Similitud rápida: Longest Common Subsequence ratio ────────────
+function similarityRatio(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    // Para mensajes muy largos, comparar los primeros 300 chars (suficiente)
+    const s1 = a.slice(0, 300), s2 = b.slice(0, 300);
+    const len = Math.max(s1.length, s2.length);
+    if (len === 0) return 1;
+    // Comparar carácter a carácter (Hamming-ish rápido)
+    let match = 0;
+    const minLen = Math.min(s1.length, s2.length);
+    for (let i = 0; i < minLen; i++) if (s1[i] === s2[i]) match++;
+    return match / len;
+}
+
+// ── Evalúa si el mensaje es spam — 100 % SÍNCRONO ─────────────────
+function evaluateSpam(message, userRec) {
+    const content = message.content || '';
+    const now = Date.now();
+
+    // ── 1. Demasiados pings de usuario (<@id> / <@!id>) ──────────
+    const pings = (content.match(/<@!?\d+>/g) || []).length;
+    if (pings > MAX_USER_PINGS) {
+        return { spam: true, reason: `${pings} menciones de usuario (máx ${MAX_USER_PINGS})` };
+    }
+
+    // ── 2. Encabezado Markdown (# / ## / ###) ────────────────────
+    if (/^#{1,6}\s+\S/.test(content.trimStart())) {
+        return { spam: true, reason: 'Encabezado Markdown (# texto)' };
+    }
+
+    // ── 3. Mensaje ENTERAMENTE EN MAYÚSCULAS ─────────────────────
+    // Quitamos URLs, menciones, emojis y puntuación; lo que queda debe tener
+    // letras y ser todo mayúsculas.
+    const stripped = content
+        .replace(/https?:\/\/\S+/g, '')          // URLs
+        .replace(/<@!?\d+>/g, '')                 // menciones usuario
+        .replace(/<#\d+>/g, '')                   // menciones canal
+        .replace(/<@&\d+>/g, '')                  // menciones rol
+        .replace(/<a?:\w+:\d+>/g, '')             // emojis personalizados
+        .replace(/[^\p{L}\p{N} ]/gu, '')          // solo letras, números y espacios
+        .trim();
+    if (stripped.length >= ALL_CAPS_MIN_LEN) {
+        const up = stripped.toUpperCase();
+        if (stripped === up && up !== stripped.toLowerCase()) {
+            return { spam: true, reason: 'Todo en MAYÚSCULAS' };
+        }
+    }
+
+    // ── 4. Duplicado exacto o casi duplicado ─────────────────────
+    const attCount = message.attachments?.size || 0;
+    userRec.msgs = userRec.msgs.filter(m => now - m.ts < SPAM_WINDOW_MS);
+
+    for (const prev of userRec.msgs) {
+        // Mismo contenido exacto
+        if (content && prev.content === content) {
+            return { spam: true, reason: 'Mensaje duplicado' };
+        }
+        // Imágenes/archivos repetidos
+        if (!content && attCount > 0 && prev.attCount > 0) {
+            return { spam: true, reason: 'Archivo/imagen duplicado' };
+        }
+        // Texto muy similar (≥85 %)
+        if (content.length > 20 && similarityRatio(content, prev.content) >= SIMILAR_RATIO) {
+            return { spam: true, reason: 'Mensaje casi idéntico al anterior' };
+        }
+    }
+
+    // ── 5. Flood: demasiados mensajes en la ventana ───────────────
+    if (userRec.msgs.length >= SPAM_MAX_MSGS) {
+        return { spam: true, reason: `${userRec.msgs.length + 1} mensajes en ${SPAM_WINDOW_MS / 1000}s` };
+    }
+
+    // Mensaje legítimo — registrar
+    userRec.msgs.push({ content, attCount, ts: now });
+    return { spam: false };
+}
+
+// ── Set de usuarios que ya están siendo purgados ──────────────────
+// Evita que múltiples manejadores simultáneos lancen la misma purga.
+const purgeLock = new Set(); // `${guildId}:${userId}`
+
+client.on('messageCreate', async (message) => {
+    if (!message.guild || message.author?.bot) return;
+
+    // ── Verificar configuración (caché en memoria, sin esperar DB) ─
+    let enabled = antispamEnabled(message.guild.id);
+    if (enabled === null) enabled = await refreshAntispamCache(message.guild.id);
+    if (!enabled) return;
+
+    // ── Exención para moderadores (sincrónico, usa la caché de roles) ─
+    const member = message.member;
+    if (member && isModerator(member)) return;
+
+    // ── Obtener / crear registro del usuario ──────────────────────
+    if (!spamTracker.has(message.guild.id)) spamTracker.set(message.guild.id, new Map());
+    const guildMap = spamTracker.get(message.guild.id);
+    if (!guildMap.has(message.author.id)) guildMap.set(message.author.id, { msgs: [] });
+    const userRec = guildMap.get(message.author.id);
+
+    // ── Evaluar (SÍNCRONO — sin await antes de este punto) ────────
+    const result = evaluateSpam(message, userRec);
+    if (!result.spam) return;
+
+    // ── Registrar estadística (síncrono) ─────────────────────────
+    recordSpamStat(message.guild.id, message.author.id, result.reason);
+
+    // ── Borrar el mensaje infractor inmediatamente ────────────────
+    message.delete().catch(() => {});
+
+    // ── Purga en masa: borrar TODOS los mensajes recientes del usuario ─
+    // Solo un proceso de purga por usuario a la vez (evita race conditions).
+    const lockKey = `${message.guild.id}:${message.author.id}`;
+    if (!purgeLock.has(lockKey)) {
+        purgeLock.add(lockKey);
+        (async () => {
+            try {
+                // Limpiar el historial del tracker para este usuario
+                userRec.msgs = [];
+
+                // Fetch los últimos 100 mensajes del canal y eliminar los del spammer (silencioso)
+                const fetched = await message.channel.messages.fetch({ limit: 100 }).catch(() => null);
+                if (fetched) {
+                    const toDelete = fetched.filter(m =>
+                        m.author.id === message.author.id &&
+                        !m.deleted &&
+                        Date.now() - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000
+                    );
+                    if (toDelete.size > 0) {
+                        if (toDelete.size >= 2) {
+                            await message.channel.bulkDelete(toDelete, true).catch(() => {
+                                toDelete.forEach(m => m.delete().catch(() => {}));
+                            });
+                        } else {
+                            toDelete.forEach(m => m.delete().catch(() => {}));
+                        }
+                    }
+                }
+
+                console.log(`[AntiSpam] Purga silenciosa de ${message.author.tag} en #${message.channel.name} (${message.guild.name}): ${result.reason}`);
+            } finally {
+                setTimeout(() => purgeLock.delete(lockKey), 3000);
+            }
+        })();
+    }
+});
 
 // ─── Persistencia de avisos / watchlist en MongoDB ───
 const warningSchema = new mongoose.Schema({
@@ -2887,6 +3111,86 @@ client.on('interactionCreate', async (interaction) => {
             } else {
                 const embed = modEmbed('📥 Mensajes de Bienvenida', 'Se han **desactivado** los mensajes de bienvenida públicos en este servidor.', MODC.RED);
                 await interaction.reply({ embeds: [embed] });
+            }
+        }
+        else if (commandName === 'antispam') {
+            const accion = options.getString('accion');
+            let cfg = await AntispamConfig.findOne({ guildId: guild.id });
+            if (!cfg) cfg = await AntispamConfig.create({ guildId: guild.id });
+
+            cfg.enabled = accion === 'on';
+            await cfg.save();
+
+            if (cfg.enabled) {
+                // Limpiar tracker y estadísticas al activar
+                spamTracker.delete(guild.id);
+                antispamStats.delete(guild.id);
+                getOrCreateStats(guild.id); // inicializar sesión nueva
+                antispamCache.set(guild.id, { enabled: true, fetchedAt: Date.now() });
+
+                const embed = new EmbedBuilder()
+                    .setColor(MODC.GREEN)
+                    .setTitle('🛡️ Anti-Spam Activado')
+                    .setDescription('El filtro anti-spam está ahora **activo** en este servidor.')
+                    .setFooter({ text: `Activado por ${user.tag}` })
+                    .setTimestamp();
+                return interaction.reply({ embeds: [embed] });
+
+            } else {
+                // Actualizar caché inmediatamente
+                antispamCache.set(guild.id, { enabled: false, fetchedAt: Date.now() });
+                spamTracker.delete(guild.id);
+
+                // ── Generar informe de sesión ─────────────────────
+                const stats = antispamStats.get(guild.id);
+                antispamStats.delete(guild.id);
+
+                if (!stats || stats.total === 0) {
+                    const embed = new EmbedBuilder()
+                        .setColor(MODC.RED)
+                        .setTitle('🛡️ Anti-Spam Desactivado')
+                        .setDescription('El filtro anti-spam ha sido desactivado.\nNo se detectó actividad de spam durante esta sesión.')
+                        .setFooter({ text: `Desactivado por ${user.tag}` })
+                        .setTimestamp();
+                    return interaction.reply({ embeds: [embed] });
+                }
+
+                // Duración de sesión
+                const sessionMs = Date.now() - stats.startedAt;
+                const sessionMins = Math.floor(sessionMs / 60000);
+                const sessionSecs = Math.floor((sessionMs % 60000) / 1000);
+                const durationStr = sessionMins > 0 ? `${sessionMins}m ${sessionSecs}s` : `${sessionSecs}s`;
+
+                // Top spammers (máx 10)
+                const topUsers = [...stats.byUser.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 10);
+                const topUsersStr = topUsers
+                    .map(([uid, count], i) => `\`${i + 1}.\` <@${uid}> — **${count}** mensaje${count !== 1 ? 's' : ''}`)
+                    .join('\n');
+
+                // Desglose por tipo de infracción
+                const topReasons = [...stats.byReason.entries()]
+                    .sort((a, b) => b[1] - a[1]);
+                const reasonsStr = topReasons
+                    .map(([reason, count]) => `• ${reason}: **${count}**`)
+                    .join('\n');
+
+                const reportEmbed = new EmbedBuilder()
+                    .setColor(MODC.RED)
+                    .setTitle('🛡️ Anti-Spam Desactivado — Informe de Sesión')
+                    .setDescription(`Resumen de actividad detectada durante esta sesión de anti-spam.`)
+                    .addFields(
+                        { name: '⏱️ Duración de sesión', value: durationStr, inline: true },
+                        { name: '🗑️ Total eliminados', value: `**${stats.total}** mensaje${stats.total !== 1 ? 's' : ''}`, inline: true },
+                        { name: '👥 Usuarios implicados', value: `**${stats.byUser.size}**`, inline: true },
+                        { name: '🏆 Mayores spammers', value: topUsersStr || 'N/A' },
+                        { name: '📊 Infracciones por tipo', value: reasonsStr || 'N/A' },
+                    )
+                    .setFooter({ text: `Desactivado por ${user.tag}` })
+                    .setTimestamp();
+
+                return interaction.reply({ embeds: [reportEmbed] });
             }
         }
         else if (commandName === 'autorol') {
